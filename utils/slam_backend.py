@@ -398,6 +398,7 @@ def fit_twist_probabilistic(
     cluster_covariance=True,
     cluster_block_size=32,
     cluster_small_sample_correction=True,
+    fixed_xi=None,
 ):
     """
     Generalized least-squares camera-twist estimation with a local covariance
@@ -419,6 +420,9 @@ def fit_twist_probabilistic(
         valid_mask: [H,W] candidate static pixels.
         flow_var_px2: [H,W] isotropic per-component flow variance.
         depth_var_m2: [H,W] depth variance in meter^2.
+        fixed_xi: optional [6] baseline twist. When provided, M1 runs in
+            strict shadow mode: the pose mean is not re-estimated and the
+            covariance is evaluated around this fixed baseline estimate.
 
     Returns:
         dict containing xi [6], the selected covariance in cov [6,6],
@@ -451,9 +455,12 @@ def fit_twist_probabilistic(
 
     num_pixels = int(valid.sum().item())
     if num_pixels < min_pixels:
-        xi = fit_twist_weighted(
-            depth, flow_px, K, valid, robust=robust, iters=max(2, iters // 2)
-        )
+        if fixed_xi is None:
+            xi = fit_twist_weighted(
+                depth, flow_px, K, valid, robust=robust, iters=max(2, iters // 2)
+            )
+        else:
+            xi = fixed_xi.detach().to(device=device, dtype=dtype)
         huge_cov = torch.eye(6, device=device, dtype=dtype) * 1e3
         return {
             "xi": xi,
@@ -475,11 +482,16 @@ def fit_twist_probabilistic(
     flow_var = flow_var_px2[valid]
     depth_var = depth_var_m2[valid]
 
-    # Start from the original robust solver so enabling M1 changes as little
-    # as possible about the pose mean on the first iteration.
-    xi = fit_twist_weighted(
-        depth, flow_px, K, valid, robust=True, iters=5
-    ).detach()
+    # In strict shadow mode fixed_xi is the exact baseline pose estimate.
+    # Otherwise retain the standalone probabilistic refit behavior.
+    if fixed_xi is None:
+        xi = fit_twist_weighted(
+            depth, flow_px, K, valid, robust=True, iters=5
+        ).detach()
+        optimize_xi = True
+    else:
+        xi = fixed_xi.detach().to(device=device, dtype=dtype)
+        optimize_xi = False
 
     I6 = torch.eye(6, device=device, dtype=dtype)
 
@@ -507,30 +519,31 @@ def fit_twist_probabilistic(
         return Rinv, residual, maha
 
     Hmat = None
-    for _ in range(iters):
-        Rinv, _, maha = covariance_and_innovation(xi)
+    if optimize_xi:
+        for _ in range(iters):
+            Rinv, _, maha = covariance_and_innovation(xi)
 
-        if robust:
-            robust_w = 1.0 / (1.0 + maha / (cauchy_c * cauchy_c))
-        else:
-            robust_w = torch.ones_like(maha)
+            if robust:
+                robust_w = 1.0 / (1.0 + maha / (cauchy_c * cauchy_c))
+            else:
+                robust_w = torch.ones_like(maha)
 
-        Wn = Rinv * robust_w[:, None, None]
-        A = torch.einsum("nai,nab,nbj->ij", Lv, Wn, Lv)
-        b = torch.einsum("nai,nab,nb->i", Lv, Wn, fv)
+            Wn = Rinv * robust_w[:, None, None]
+            A = torch.einsum("nai,nab,nbj->ij", Lv, Wn, Lv)
+            b = torch.einsum("nai,nab,nb->i", Lv, Wn, fv)
 
-        mean_diag = torch.diagonal(A).mean().abs().clamp_min(1e-12)
-        Hmat = A + damping * mean_diag * I6
+            mean_diag = torch.diagonal(A).mean().abs().clamp_min(1e-12)
+            Hmat = A + damping * mean_diag * I6
 
-        try:
-            xi_new = torch.linalg.solve(Hmat, b)
-        except RuntimeError:
-            xi_new = torch.linalg.lstsq(Hmat, b).solution
+            try:
+                xi_new = torch.linalg.solve(Hmat, b)
+            except RuntimeError:
+                xi_new = torch.linalg.lstsq(Hmat, b).solution
 
-        if torch.norm(xi_new - xi) < 1e-7:
+            if torch.norm(xi_new - xi) < 1e-7:
+                xi = xi_new
+                break
             xi = xi_new
-            break
-        xi = xi_new
 
     # Recompute information and keep the final residual, which is also
     # required by the cluster-robust sandwich score below.
@@ -629,6 +642,7 @@ def fit_twist_probabilistic(
         "cluster_count": cluster_count,
         "cluster_block_size": block_size,
         "covariance_mode": covariance_mode,
+        "fixed_xi": not optimize_xi,
     }
 
 
