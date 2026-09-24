@@ -223,7 +223,7 @@ class FrontEnd(mp.Process):
         self.m1_cauchy_c = float(unc_cfg.get("cauchy_c", 2.0))
         self.m1_damping = float(unc_cfg.get("damping", 1e-6))
         self.m1_min_pixels = int(unc_cfg.get("min_pixels", 500))
-        self.m1_residual_rescale = bool(unc_cfg.get("residual_rescale", True))
+        self.m1_residual_rescale = bool(unc_cfg.get("residual_rescale", False))
         self.m1_save_diagnostics = bool(unc_cfg.get("save_diagnostics", True))
 
         self.dynamic_objects = 0
@@ -565,12 +565,39 @@ class FrontEnd(mp.Process):
                             )
 
                         T_rel_applied = torch.linalg.inv(T_prev) @ T_curr
+
+                        # Ground-truth relative pose in the same right-composed
+                        # convention used by the raw Flow4DGS update:
+                        # T_curr = T_prev @ T_rel.
+                        T_prev_gt = torch.eye(
+                            4, device=T_prev.device, dtype=T_prev.dtype
+                        )
+                        T_prev_gt[:3, :3] = prev.R_gt.to(
+                            device=T_prev.device, dtype=T_prev.dtype
+                        )
+                        T_prev_gt[:3, 3] = prev.T_gt.to(
+                            device=T_prev.device, dtype=T_prev.dtype
+                        )
+
+                        T_curr_gt = torch.eye(
+                            4, device=T_prev.device, dtype=T_prev.dtype
+                        )
+                        T_curr_gt[:3, :3] = viewpoint.R_gt.to(
+                            device=T_prev.device, dtype=T_prev.dtype
+                        )
+                        T_curr_gt[:3, 3] = viewpoint.T_gt.to(
+                            device=T_prev.device, dtype=T_prev.dtype
+                        )
+
+                        T_rel_gt = torch.linalg.inv(T_prev_gt) @ T_curr_gt
+
                         payload = {
                             "frame": int(viewpoint.uid),
                             "xi_raw": xi.detach().cpu(),
                             "P_xi_raw": P_xi.detach().cpu(),
                             "T_rel_raw": T_rel.detach().cpu(),
                             "T_rel_applied": T_rel_applied.detach().cpu(),
+                            "T_rel_gt": T_rel_gt.detach().cpu(),
                             "sigma_trans_m": sigma_trans.detach().cpu(),
                             "sigma_rot_rad": sigma_rot.detach().cpu(),
                             "kappa": m1_result["kappa"].detach().cpu(),
