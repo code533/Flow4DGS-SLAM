@@ -213,3 +213,40 @@ delta_xi = xi_est - Log(T_rel_gt)
 
 rather than only the group-space error `Log(T_rel_gt^{-1} T_rel_est)`.
 It also tests the inverse GT convention as a sanity check.
+
+
+## M1.2: strict shadow mode and cache isolation
+
+M1 now defaults to strict shadow mode:
+
+```yaml
+Uncertainty:
+  shadow_mode: true
+  log_keyframe_reasons: true
+```
+
+In shadow mode, the original Flow4DGS pose mean from
+`fit_twist_weighted(..., iters=30)` remains the pose used by tracking,
+mapping, and keyframe selection. The probabilistic module only evaluates
+covariance around that fixed baseline twist. This prevents uncertainty
+experiments from silently changing the SLAM state trajectory.
+
+The bidirectional flow used for forward/backward consistency is also computed
+with `cache=False`. This prevents the temporary current<->previous flow pair
+from populating `Camera.flow` / `Camera.flow_back`, which are later reused
+by backend mapping against a potentially different keyframe.
+
+Keyframe creation now optionally logs the trigger:
+
+- frame index,
+- previous keyframe index,
+- frame gap,
+- geometric decision,
+- forced gap-of-5 trigger,
+- dynamic-start trigger,
+- new-object trigger.
+
+With shadow mode enabled, M1 should not intentionally change the baseline
+pose mean or keyframe-selection inputs. Remaining keyframe differences should
+therefore be investigated as scheduling/non-determinism or another unrelated
+state mutation rather than as an uncertainty-estimator effect.
