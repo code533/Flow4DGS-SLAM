@@ -541,17 +541,17 @@ class FrontEnd(mp.Process):
                     # Keep the covariance tied to the raw GLS relative-pose
                     # estimate. The subsequent Flow4DGS motion cap is a
                     # baseline heuristic and is logged separately.
+                    P_xi = m1_result["cov"]
+                    diag = torch.diagonal(P_xi)
+                    sigma_trans = torch.sqrt(diag[:3].clamp_min(0.0))
+                    sigma_rot = torch.sqrt(diag[3:].clamp_min(0.0))
+
                     if self.m1_save_diagnostics:
                         m1_dir = os.path.join(
                             self.config["Results"]["save_dir"],
                             "m1_pose_uncertainty",
                         )
                         os.makedirs(m1_dir, exist_ok=True)
-
-                        P_xi = m1_result["cov"]
-                        diag = torch.diagonal(P_xi)
-                        sigma_trans = torch.sqrt(diag[:3].clamp_min(0.0))
-                        sigma_rot = torch.sqrt(diag[3:].clamp_min(0.0))
 
                         if static_prob_mask.any():
                             fb_median = fb_error_px[static_prob_mask].median()
