@@ -128,5 +128,5 @@ Uncertainty:
   cauchy_c: 2.0
   damping: 1.0e-6
   min_pixels: 500
-  residual_rescale: true
+  residual_rescale: false
   save_diagnostics: true
