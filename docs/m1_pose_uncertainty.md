@@ -167,3 +167,49 @@ diagnostic until calibration supports a principled rescaling rule.
 
 Existing diagnostic files created before `T_rel_gt` was added can still be
 analyzed numerically, but GT correlation and NEES require a new M1 run.
+
+
+## M1.1: spatial correlation-aware covariance
+
+Dense RAFT flow pixels are strongly spatially correlated. Treating tens of
+thousands of pixels as independent makes the naive inverse-Hessian covariance
+severely over-confident. M1.1 therefore reports both:
+
+```
+P_H = H^{-1}
+```
+
+and a spatial cluster-robust sandwich covariance:
+
+```
+P_CR = A^{-1} B A^{-1},
+B = sum_b S_b S_b^T,
+S_b = sum_{p in block b} J_p^T W_p r_p.
+```
+
+Pixels inside one image block may be arbitrarily correlated; approximate
+independence is only assumed across blocks. The default block size is 32x32.
+The pose mean is unchanged by this covariance upgrade.
+
+Configuration:
+
+```yaml
+Uncertainty:
+  cluster_covariance: true
+  cluster_block_size: 32
+  cluster_small_sample_correction: true
+```
+
+New diagnostics save `P_xi_hessian`, `P_xi_cluster`, the selected
+`P_xi_raw`, cluster count, block size, and covariance mode.
+
+The analyzer now also performs a pose-convention audit. Since the fitted
+covariance is the covariance of the twist parameter `xi`, its primary NEES
+uses
+
+```
+delta_xi = xi_est - Log(T_rel_gt)
+```
+
+rather than only the group-space error `Log(T_rel_gt^{-1} T_rel_est)`.
+It also tests the inverse GT convention as a sanity check.
