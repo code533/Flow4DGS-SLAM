@@ -393,8 +393,11 @@ def fit_twist_probabilistic(
     iters=10,
     cauchy_c=2.0,
     damping=1e-6,
-    residual_rescale=True,
+    residual_rescale=False,
     min_pixels=500,
+    cluster_covariance=True,
+    cluster_block_size=32,
+    cluster_small_sample_correction=True,
 ):
     """
     Generalized least-squares camera-twist estimation with a local covariance
@@ -418,8 +421,16 @@ def fit_twist_probabilistic(
         depth_var_m2: [H,W] depth variance in meter^2.
 
     Returns:
-        dict containing xi [6], cov [6,6], information [6,6],
-        maha_map [H,W], kappa, condition and num_pixels.
+        dict containing xi [6], the selected covariance in cov [6,6],
+        the naive inverse-Hessian covariance in cov_hessian [6,6],
+        the spatial cluster-robust sandwich covariance in cov_cluster [6,6],
+        information [6,6], maha_map [H,W], kappa, condition, num_pixels,
+        and cluster_count.
+
+    The cluster covariance treats pixels inside each image block as potentially
+    correlated and only assumes approximate independence across spatial
+    clusters. This is intended to reduce the severe over-confidence caused by
+    treating dense optical-flow pixels as independent observations.
     """
     H, W = depth.shape
     device, dtype = depth.device, depth.dtype
@@ -447,11 +458,16 @@ def fit_twist_probabilistic(
         return {
             "xi": xi,
             "cov": huge_cov,
+            "cov_hessian": huge_cov.clone(),
+            "cov_cluster": huge_cov.clone(),
             "information": torch.zeros((6, 6), device=device, dtype=dtype),
             "maha_map": torch.zeros((H, W), device=device, dtype=dtype),
             "kappa": torch.tensor(float("inf"), device=device, dtype=dtype),
             "condition": torch.tensor(float("inf"), device=device, dtype=dtype),
             "num_pixels": num_pixels,
+            "cluster_count": 0,
+            "cluster_block_size": int(cluster_block_size),
+            "covariance_mode": "fallback",
         }
 
     Lv = L[valid]                  # [N,2,6]
@@ -531,12 +547,67 @@ def fit_twist_probabilistic(
     if residual_rescale:
         dof = max(2 * num_pixels - 6, 1)
         kappa = (robust_w * maha).sum() / float(dof)
-        kappa = torch.clamp(kappa, min=1e-3, max=1e3)
+        # Never let a residual scale below one make the covariance more
+        # confident than the local Fisher/Gauss-Newton approximation.
+        kappa = torch.clamp(kappa, min=1.0, max=1e3)
     else:
         kappa = torch.ones((), device=device, dtype=dtype)
 
-    cov = kappa * torch.linalg.pinv(Hmat)
-    cov = 0.5 * (cov + cov.T)
+    bread_inv = torch.linalg.pinv(Hmat)
+    cov_hessian = kappa * bread_inv
+    cov_hessian = 0.5 * (cov_hessian + cov_hessian.T)
+
+    # Spatial cluster-robust sandwich covariance:
+    #   P_CR = A^{-1} (sum_b S_b S_b^T) A^{-1}
+    # where S_b is the sum of per-pixel estimating-equation scores inside
+    # one image block. This allows arbitrary residual correlation within each
+    # block and avoids treating every dense-flow pixel as independent.
+    block_size = max(int(cluster_block_size), 1)
+    valid_y, valid_x = torch.where(valid)
+    n_blocks_x = (W + block_size - 1) // block_size
+    n_blocks_y = (H + block_size - 1) // block_size
+    n_blocks_total = n_blocks_x * n_blocks_y
+    cluster_id = (valid_y // block_size) * n_blocks_x + (valid_x // block_size)
+
+    # Score for each pixel: J_p^T W_p r_p. The sign of residual is irrelevant
+    # for the outer product used by the sandwich "meat".
+    pixel_score = torch.einsum(
+        "nai,nab,nb->ni", Lv, Wn, residual
+    )
+    cluster_score = torch.zeros(
+        (n_blocks_total, 6), device=device, dtype=dtype
+    )
+    cluster_score.index_add_(0, cluster_id, pixel_score)
+
+    active = cluster_score.abs().sum(dim=1) > 0
+    cluster_score = cluster_score[active]
+    cluster_count = int(cluster_score.shape[0])
+
+    if cluster_count >= 2:
+        meat = cluster_score.T @ cluster_score
+        correction = 1.0
+        if cluster_small_sample_correction and num_pixels > 6:
+            correction = (
+                (cluster_count / float(cluster_count - 1))
+                * ((num_pixels - 1) / float(num_pixels - 6))
+            )
+        cov_cluster = correction * (bread_inv @ meat @ bread_inv)
+        cov_cluster = 0.5 * (cov_cluster + cov_cluster.T)
+
+        # Numerical PSD projection; sandwich covariance is PSD analytically.
+        ceig, cvec = torch.linalg.eigh(cov_cluster)
+        ceig = ceig.clamp_min(0.0)
+        cov_cluster = (cvec * ceig.unsqueeze(0)) @ cvec.T
+        cov_cluster = 0.5 * (cov_cluster + cov_cluster.T)
+    else:
+        cov_cluster = cov_hessian.clone()
+
+    if cluster_covariance and cluster_count >= 2:
+        cov = cov_cluster
+        covariance_mode = "cluster"
+    else:
+        cov = cov_hessian
+        covariance_mode = "hessian"
 
     eig = torch.linalg.eigvalsh(Hmat.double()).clamp_min(1e-18)
     condition = (eig[-1] / eig[0]).to(dtype)
@@ -547,11 +618,16 @@ def fit_twist_probabilistic(
     return {
         "xi": xi,
         "cov": cov,
+        "cov_hessian": cov_hessian,
+        "cov_cluster": cov_cluster,
         "information": Hmat,
         "maha_map": maha_map,
         "kappa": kappa,
         "condition": condition,
         "num_pixels": num_pixels,
+        "cluster_count": cluster_count,
+        "cluster_block_size": block_size,
+        "covariance_mode": covariance_mode,
     }
 
 
