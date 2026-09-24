@@ -532,8 +532,9 @@ def fit_twist_probabilistic(
             break
         xi = xi_new
 
-    # Recompute information at the final estimate.
-    Rinv, _, maha = covariance_and_innovation(xi)
+    # Recompute information and keep the final residual, which is also
+    # required by the cluster-robust sandwich score below.
+    Rinv, residual, maha = covariance_and_innovation(xi)
     if robust:
         robust_w = 1.0 / (1.0 + maha / (cauchy_c * cauchy_c))
     else:
