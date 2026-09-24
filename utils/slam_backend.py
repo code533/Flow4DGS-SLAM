@@ -236,6 +236,103 @@ def build_interaction_matrix(depth, K):
     L = torch.stack([L_top, L_bot], dim=2).reshape(-1, 6)  # [2HW,6]
     return L
 
+
+def build_depth_flow_jacobian(depth, K, xi):
+    """
+    Jacobian of the rigid image motion with respect to depth.
+
+    Args:
+        depth: [H,W] depth in meters.
+        K: [3,3] camera intrinsics.
+        xi: [6] twist [tx, ty, tz, wx, wy, wz].
+
+    Returns:
+        J_D: [H,W,2], d(flow_u, flow_v) / dZ in pixel / meter.
+    """
+    H, W = depth.shape
+    fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
+    x, y = _mesh(H, W, depth.device, depth.dtype)
+    u = x - cx
+    v = y - cy
+    Z = depth.clamp_min(1e-6)
+
+    tx, ty, tz = xi[0], xi[1], xi[2]
+    dFu_dZ = (fx * tx - u * tz) / (Z * Z)
+    dFv_dZ = (fy * ty - v * tz) / (Z * Z)
+    return torch.stack([dFu_dZ, dFv_dZ], dim=-1)
+
+
+def estimate_fb_flow_variance_px(
+    flow_bwd_px,
+    flow_fwd_px,
+    sigma0_px=0.5,
+    lambda_fb=1.0,
+    max_sigma_px=20.0,
+):
+    """
+    Estimate a per-pixel optical-flow covariance proxy from forward/backward
+    consistency.
+
+    Args:
+        flow_bwd_px: [2,H,W], current -> previous, pixel units.
+        flow_fwd_px: [2,H,W], previous -> current, pixel units.
+        sigma0_px: minimum per-component flow standard deviation.
+        lambda_fb: scale applied to the forward/backward consistency error.
+        max_sigma_px: maximum per-component standard deviation.
+
+    Returns:
+        flow_var_px2: [H,W] isotropic per-component variance in pixel^2.
+        valid: [H,W] pixels whose backward-warped location is in bounds.
+        fb_error_px: [H,W] L2 forward/backward consistency error in pixels.
+    """
+    assert flow_bwd_px.ndim == 3 and flow_bwd_px.shape[0] == 2
+    assert flow_fwd_px.shape == flow_bwd_px.shape
+
+    _, H, W = flow_bwd_px.shape
+    device, dtype = flow_bwd_px.device, flow_bwd_px.dtype
+    x, y = _mesh(H, W, device, dtype)
+
+    # A current-frame pixel p is sent to p' in the previous frame by F_bwd.
+    x_prev = x + flow_bwd_px[0]
+    y_prev = y + flow_bwd_px[1]
+
+    valid = (
+        (x_prev >= 0.0) & (x_prev <= W - 1) &
+        (y_prev >= 0.0) & (y_prev <= H - 1)
+    )
+
+    gx = 2.0 * x_prev / max(W - 1, 1) - 1.0
+    gy = 2.0 * y_prev / max(H - 1, 1) - 1.0
+    grid = torch.stack([gx, gy], dim=-1)[None]
+
+    # Sample the inverse-direction flow at the warped location.
+    fwd_warped = F.grid_sample(
+        flow_fwd_px[None],
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )[0]
+
+    fb_vec = flow_bwd_px + fwd_warped
+    fb_error2 = (fb_vec * fb_vec).sum(dim=0)
+    fb_error_px = torch.sqrt(fb_error2 + 1e-12)
+
+    # fb_error^2 contains two components; use half of it as an isotropic
+    # per-component variance proxy. This scale is intentionally configurable
+    # and will be calibrated in M1 experiments.
+    flow_var_px2 = sigma0_px ** 2 + 0.5 * lambda_fb * fb_error2
+    flow_var_px2 = torch.clamp(
+        flow_var_px2,
+        min=float(sigma0_px) ** 2,
+        max=float(max_sigma_px) ** 2,
+    )
+
+    # Out-of-bounds consistency cannot be evaluated. Keep a finite variance,
+    # but let the caller remove these pixels through 'valid'.
+    return flow_var_px2, valid, fb_error_px
+
+
 def fit_twist_weighted(depth, flow_px, K, depth_valid, robust=True, iters=2, plain=False):
     """
     depth: [H,W], flow_px: [2,H,W] in pixels, K: [3,3]
@@ -283,6 +380,180 @@ def fit_twist_weighted(depth, flow_px, K, depth_valid, robust=True, iters=2, pla
         w = 1.0 / (1.0 + z*z)                       # Cauchy weights
 
     return xi
+
+
+def fit_twist_probabilistic(
+    depth,
+    flow_px,
+    K,
+    valid_mask,
+    flow_var_px2,
+    depth_var_m2,
+    robust=True,
+    iters=10,
+    cauchy_c=2.0,
+    damping=1e-6,
+    residual_rescale=True,
+    min_pixels=500,
+):
+    """
+    Generalized least-squares camera-twist estimation with a local covariance
+    approximation.
+
+    Per pixel:
+        f_p = L_p xi + eps_p
+        R_p = sigma_F^2 I + J_D sigma_D^2 J_D^T
+
+    The robust Cauchy weight is applied to the 2-D Mahalanobis innovation.
+    The returned covariance is a local Gauss-Newton/Laplace approximation
+    conditioned on the final robust weights, rather than an exact Bayesian
+    posterior.
+
+    Args:
+        depth: [H,W] meters.
+        flow_px: [2,H,W] measured optical flow in pixels.
+        K: [3,3] intrinsics.
+        valid_mask: [H,W] candidate static pixels.
+        flow_var_px2: [H,W] isotropic per-component flow variance.
+        depth_var_m2: [H,W] depth variance in meter^2.
+
+    Returns:
+        dict containing xi [6], cov [6,6], information [6,6],
+        maha_map [H,W], kappa, condition and num_pixels.
+    """
+    H, W = depth.shape
+    device, dtype = depth.device, depth.dtype
+
+    L = build_interaction_matrix(depth, K).reshape(H, W, 2, 6)
+    f = flow_px.permute(1, 2, 0)
+
+    valid = (
+        valid_mask.bool()
+        & torch.isfinite(depth)
+        & (depth > 0)
+        & torch.isfinite(f).all(dim=-1)
+        & torch.isfinite(flow_var_px2)
+        & (flow_var_px2 > 0)
+        & torch.isfinite(depth_var_m2)
+        & (depth_var_m2 >= 0)
+    )
+
+    num_pixels = int(valid.sum().item())
+    if num_pixels < min_pixels:
+        xi = fit_twist_weighted(
+            depth, flow_px, K, valid, robust=robust, iters=max(2, iters // 2)
+        )
+        huge_cov = torch.eye(6, device=device, dtype=dtype) * 1e3
+        return {
+            "xi": xi,
+            "cov": huge_cov,
+            "information": torch.zeros((6, 6), device=device, dtype=dtype),
+            "maha_map": torch.zeros((H, W), device=device, dtype=dtype),
+            "kappa": torch.tensor(float("inf"), device=device, dtype=dtype),
+            "condition": torch.tensor(float("inf"), device=device, dtype=dtype),
+            "num_pixels": num_pixels,
+        }
+
+    Lv = L[valid]                  # [N,2,6]
+    fv = f[valid]                  # [N,2]
+    flow_var = flow_var_px2[valid]
+    depth_var = depth_var_m2[valid]
+
+    # Start from the original robust solver so enabling M1 changes as little
+    # as possible about the pose mean on the first iteration.
+    xi = fit_twist_weighted(
+        depth, flow_px, K, valid, robust=True, iters=5
+    ).detach()
+
+    I6 = torch.eye(6, device=device, dtype=dtype)
+
+    def covariance_and_innovation(xi_now):
+        J_D = build_depth_flow_jacobian(depth, K, xi_now)[valid]
+        ju, jv = J_D[:, 0], J_D[:, 1]
+
+        # R = sigma_F^2 I_2 + sigma_D^2 J_D J_D^T
+        r00 = flow_var + depth_var * ju * ju + 1e-8
+        r11 = flow_var + depth_var * jv * jv + 1e-8
+        r01 = depth_var * ju * jv
+        det = (r00 * r11 - r01 * r01).clamp_min(1e-12)
+
+        Rinv = torch.empty((num_pixels, 2, 2), device=device, dtype=dtype)
+        Rinv[:, 0, 0] = r11 / det
+        Rinv[:, 1, 1] = r00 / det
+        Rinv[:, 0, 1] = -r01 / det
+        Rinv[:, 1, 0] = -r01 / det
+
+        pred = torch.einsum("nai,i->na", Lv, xi_now)
+        residual = fv - pred
+        maha = torch.einsum(
+            "na,nab,nb->n", residual, Rinv, residual
+        ).clamp_min(0.0)
+        return Rinv, residual, maha
+
+    Hmat = None
+    for _ in range(iters):
+        Rinv, _, maha = covariance_and_innovation(xi)
+
+        if robust:
+            robust_w = 1.0 / (1.0 + maha / (cauchy_c * cauchy_c))
+        else:
+            robust_w = torch.ones_like(maha)
+
+        Wn = Rinv * robust_w[:, None, None]
+        A = torch.einsum("nai,nab,nbj->ij", Lv, Wn, Lv)
+        b = torch.einsum("nai,nab,nb->i", Lv, Wn, fv)
+
+        mean_diag = torch.diagonal(A).mean().abs().clamp_min(1e-12)
+        Hmat = A + damping * mean_diag * I6
+
+        try:
+            xi_new = torch.linalg.solve(Hmat, b)
+        except RuntimeError:
+            xi_new = torch.linalg.lstsq(Hmat, b).solution
+
+        if torch.norm(xi_new - xi) < 1e-7:
+            xi = xi_new
+            break
+        xi = xi_new
+
+    # Recompute information at the final estimate.
+    Rinv, _, maha = covariance_and_innovation(xi)
+    if robust:
+        robust_w = 1.0 / (1.0 + maha / (cauchy_c * cauchy_c))
+    else:
+        robust_w = torch.ones_like(maha)
+
+    Wn = Rinv * robust_w[:, None, None]
+    A = torch.einsum("nai,nab,nbj->ij", Lv, Wn, Lv)
+    mean_diag = torch.diagonal(A).mean().abs().clamp_min(1e-12)
+    Hmat = A + damping * mean_diag * I6
+
+    if residual_rescale:
+        dof = max(2 * num_pixels - 6, 1)
+        kappa = (robust_w * maha).sum() / float(dof)
+        kappa = torch.clamp(kappa, min=1e-3, max=1e3)
+    else:
+        kappa = torch.ones((), device=device, dtype=dtype)
+
+    cov = kappa * torch.linalg.pinv(Hmat)
+    cov = 0.5 * (cov + cov.T)
+
+    eig = torch.linalg.eigvalsh(Hmat.double()).clamp_min(1e-18)
+    condition = (eig[-1] / eig[0]).to(dtype)
+
+    maha_map = torch.zeros((H, W), device=device, dtype=dtype)
+    maha_map[valid] = maha
+
+    return {
+        "xi": xi,
+        "cov": cov,
+        "information": Hmat,
+        "maha_map": maha_map,
+        "kappa": kappa,
+        "condition": condition,
+        "num_pixels": num_pixels,
+    }
+
 
 def predict_rigid_flow_px(depth, K, xi):
     """
