@@ -230,6 +230,10 @@ class FrontEnd(mp.Process):
         self.m1_cluster_small_sample = bool(
             unc_cfg.get("cluster_small_sample_correction", True)
         )
+        self.m1_shadow_mode = bool(unc_cfg.get("shadow_mode", True))
+        self.m1_keyframe_reason_log = bool(
+            unc_cfg.get("log_keyframe_reasons", True)
+        )
 
         self.dynamic_objects = 0
 
@@ -382,6 +386,7 @@ class FrontEnd(mp.Process):
                     viewpoint.original_image.cuda(),
                     prev.original_image.cuda(),
                     tracking=False,
+                    cache=False,
                 )
             else:
                 flow_back = viewpoint.generate_flow(
@@ -439,6 +444,19 @@ class FrontEnd(mp.Process):
                 depth_valid = (depth_tensor > 0) & torch.isfinite(depth_tensor)
                 depth_ds, depth_valid_ds, flow_px_ds, Kds = depth_tensor, depth_valid, flow_px, viewpoint.intrinsic.cuda()
                 
+                # Preserve the original Flow4DGS pose mean exactly. M1 can
+                # evaluate uncertainty in strict shadow mode without changing
+                # the state trajectory used by tracking, mapping, or keyframe
+                # selection.
+                xi_baseline = fit_twist_weighted(
+                    depth_ds,
+                    flow_px_ds,
+                    Kds,
+                    static_inliers_ds,
+                    robust=True,
+                    iters=30,
+                )
+
                 m1_result = None
                 fb_error_px = None
                 static_prob_mask = static_inliers_ds
@@ -485,8 +503,9 @@ class FrontEnd(mp.Process):
                         cluster_covariance=self.m1_cluster_covariance,
                         cluster_block_size=self.m1_cluster_block_size,
                         cluster_small_sample_correction=self.m1_cluster_small_sample,
+                        fixed_xi=xi_baseline if self.m1_shadow_mode else None,
                     )
-                    xi = m1_result["xi"]
+                    xi = xi_baseline if self.m1_shadow_mode else m1_result["xi"]
                     viewpoint.pose_cov_rel_raw = m1_result["cov"].detach().cpu()
                     viewpoint.pose_cov_rel_hessian = m1_result[
                         "cov_hessian"
@@ -495,14 +514,7 @@ class FrontEnd(mp.Process):
                         "cov_cluster"
                     ].detach().cpu()
                 else:
-                    xi = fit_twist_weighted(
-                        depth_ds,
-                        flow_px_ds,
-                        Kds,
-                        static_inliers_ds,
-                        robust=True,
-                        iters=30,
-                    )
+                    xi = xi_baseline
 
                 rigid_flow_px = predict_rigid_flow_px(depth_ds, Kds, xi)
                 rigid_flow_out = pixels_to_flow_units(rigid_flow_px, H, W, mode='grid')
@@ -610,6 +622,9 @@ class FrontEnd(mp.Process):
                         payload = {
                             "frame": int(viewpoint.uid),
                             "xi_raw": xi.detach().cpu(),
+                            "xi_baseline": xi_baseline.detach().cpu(),
+                            "xi_probabilistic": m1_result["xi"].detach().cpu(),
+                            "shadow_mode": bool(self.m1_shadow_mode),
                             "P_xi_raw": P_xi.detach().cpu(),
                             "P_xi_hessian": P_hessian.detach().cpu(),
                             "P_xi_cluster": P_cluster.detach().cpu(),
@@ -642,6 +657,7 @@ class FrontEnd(mp.Process):
                         "kappa", float(m1_result["kappa"].detach().cpu()),
                         "cond", float(m1_result["condition"].detach().cpu()),
                         "cov", m1_result["covariance_mode"],
+                        "shadow", bool(self.m1_shadow_mode),
                         "clusters", int(m1_result["cluster_count"]),
                         "block", int(m1_result["cluster_block_size"]),
                         "N", int(m1_result["num_pixels"]),
@@ -976,15 +992,34 @@ class FrontEnd(mp.Process):
                 if self.single_thread:
                     create_kf = check_time and create_kf
                 
-                create_kf = ((cur_frame_idx - last_keyframe_idx) >= 5) or create_kf or cur_frame_idx == self.dystart
-                
-                
-                
-                if self.dataset.dynamic_objects > self.dynamic_objects and cur_frame_idx>0:
+                forced_by_gap5 = ((cur_frame_idx - last_keyframe_idx) >= 5)
+                forced_by_dystart = (cur_frame_idx == self.dystart)
+                geometric_kf = bool(create_kf)
+                create_kf = forced_by_gap5 or create_kf or forced_by_dystart
+
+                forced_by_new_object = (
+                    self.dataset.dynamic_objects > self.dynamic_objects
+                    and cur_frame_idx > 0
+                )
+                if forced_by_new_object:
                     create_kf = True
                     new_object = True
                 else:
                     new_object = False
+
+                if self.m1_keyframe_reason_log and create_kf:
+                    Log(
+                        "KF reason",
+                        "frame", int(cur_frame_idx),
+                        "last", int(last_keyframe_idx),
+                        "gap", int(cur_frame_idx - last_keyframe_idx),
+                        "check_time", bool(check_time),
+                        "geometry", bool(geometric_kf),
+                        "gap5", bool(forced_by_gap5),
+                        "dystart", bool(forced_by_dystart),
+                        "new_object", bool(forced_by_new_object),
+                        tag="Frontend",
+                    )
                     
                 if create_kf:
                     keyframe_list.append(cur_frame_idx)
