@@ -225,6 +225,11 @@ class FrontEnd(mp.Process):
         self.m1_min_pixels = int(unc_cfg.get("min_pixels", 500))
         self.m1_residual_rescale = bool(unc_cfg.get("residual_rescale", False))
         self.m1_save_diagnostics = bool(unc_cfg.get("save_diagnostics", True))
+        self.m1_cluster_covariance = bool(unc_cfg.get("cluster_covariance", True))
+        self.m1_cluster_block_size = int(unc_cfg.get("cluster_block_size", 32))
+        self.m1_cluster_small_sample = bool(
+            unc_cfg.get("cluster_small_sample_correction", True)
+        )
 
         self.dynamic_objects = 0
 
@@ -477,9 +482,18 @@ class FrontEnd(mp.Process):
                         damping=self.m1_damping,
                         residual_rescale=self.m1_residual_rescale,
                         min_pixels=self.m1_min_pixels,
+                        cluster_covariance=self.m1_cluster_covariance,
+                        cluster_block_size=self.m1_cluster_block_size,
+                        cluster_small_sample_correction=self.m1_cluster_small_sample,
                     )
                     xi = m1_result["xi"]
                     viewpoint.pose_cov_rel_raw = m1_result["cov"].detach().cpu()
+                    viewpoint.pose_cov_rel_hessian = m1_result[
+                        "cov_hessian"
+                    ].detach().cpu()
+                    viewpoint.pose_cov_rel_cluster = m1_result[
+                        "cov_cluster"
+                    ].detach().cpu()
                 else:
                     xi = fit_twist_weighted(
                         depth_ds,
@@ -542,6 +556,8 @@ class FrontEnd(mp.Process):
                     # estimate. The subsequent Flow4DGS motion cap is a
                     # baseline heuristic and is logged separately.
                     P_xi = m1_result["cov"]
+                    P_hessian = m1_result["cov_hessian"]
+                    P_cluster = m1_result["cov_cluster"]
                     diag = torch.diagonal(P_xi)
                     sigma_trans = torch.sqrt(diag[:3].clamp_min(0.0))
                     sigma_rot = torch.sqrt(diag[3:].clamp_min(0.0))
@@ -595,6 +611,11 @@ class FrontEnd(mp.Process):
                             "frame": int(viewpoint.uid),
                             "xi_raw": xi.detach().cpu(),
                             "P_xi_raw": P_xi.detach().cpu(),
+                            "P_xi_hessian": P_hessian.detach().cpu(),
+                            "P_xi_cluster": P_cluster.detach().cpu(),
+                            "covariance_mode": m1_result["covariance_mode"],
+                            "cluster_count": int(m1_result["cluster_count"]),
+                            "cluster_block_size": int(m1_result["cluster_block_size"]),
                             "T_rel_raw": T_rel.detach().cpu(),
                             "T_rel_applied": T_rel_applied.detach().cpu(),
                             "T_rel_gt": T_rel_gt.detach().cpu(),
@@ -620,6 +641,9 @@ class FrontEnd(mp.Process):
                         "sigma_r", sigma_rot.detach().cpu().tolist(),
                         "kappa", float(m1_result["kappa"].detach().cpu()),
                         "cond", float(m1_result["condition"].detach().cpu()),
+                        "cov", m1_result["covariance_mode"],
+                        "clusters", int(m1_result["cluster_count"]),
+                        "block", int(m1_result["cluster_block_size"]),
                         "N", int(m1_result["num_pixels"]),
                         tag="Frontend",
                     )
