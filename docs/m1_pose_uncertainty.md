@@ -86,7 +86,7 @@ Uncertainty:
   cauchy_c: 2.0
   damping: 1.0e-6
   min_pixels: 500
-  residual_rescale: true
+  residual_rescale: false
   save_diagnostics: true
 ```
 
@@ -109,7 +109,7 @@ Each file contains:
 - `T_rel_applied`: relative transform after the original Flow4DGS motion cap.
 - `sigma_trans_m`: standard deviations of the three translation components.
 - `sigma_rot_rad`: standard deviations of the three rotation components.
-- `kappa`: residual scale correction.
+- `kappa`: diagnostic residual scale. It is logged but, by default, no longer shrinks the covariance.
 - `condition`: condition number of the final information matrix.
 - `num_pixels`: number of pixels used by the probabilistic refit.
 - `fb_error_median_px`: median forward/backward flow consistency error.
@@ -144,3 +144,26 @@ NEES = delta_xi^T P_xi^{-1} delta_xi.
 - Robust weights are treated as fixed when computing the local covariance.
 - M1 does not yet propagate absolute pose covariance.
 - M1 does not change the motion mask, mapping, Gaussian states, or rendering.
+
+
+## GT calibration pass
+
+Current M1 diagnostics also save `T_rel_gt`, constructed in the same
+right-composed convention as the raw Flow4DGS relative update. The analysis
+script therefore reports:
+
+- raw relative translation and rotation error,
+- applied-motion error after the original Flow4DGS motion cap,
+- Pearson and Spearman error/uncertainty correlation,
+- 6-DoF, translation-only, and rotation-only NEES,
+- chi-square coverage,
+- uncertainty-quantile calibration tables.
+
+By default `residual_rescale: false`. The previously logged `kappa` often
+fell below one because robust Cauchy weighting suppresses the normalized
+residuals; using it as a covariance multiplier would make the already-local
+Gauss-Newton covariance more overconfident. We retain `kappa` as a
+diagnostic until calibration supports a principled rescaling rule.
+
+Existing diagnostic files created before `T_rel_gt` was added can still be
+analyzed numerically, but GT correlation and NEES require a new M1 run.
