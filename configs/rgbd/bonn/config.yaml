@@ -130,3 +130,6 @@ Uncertainty:
   min_pixels: 500
   residual_rescale: false
   save_diagnostics: true
+  cluster_covariance: true
+  cluster_block_size: 32
+  cluster_small_sample_correction: true
