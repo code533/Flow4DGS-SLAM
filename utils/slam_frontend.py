@@ -27,6 +27,11 @@ from utils.slam_backend import (
 )
 import torch.nn.functional as F
 from utils.pose_utils import SE3_exp, scale_se3_step, SO3_exp, so3_log
+from utils.m2_uncertainty import (
+    apply_whitened_diag_calibration,
+    propagate_right_pose_covariance,
+    relative_parameter_cov_to_right,
+)
 
 
 def flow_to_pixels(flow_norm, H, W, mode='grid'):
@@ -238,6 +243,30 @@ class FrontEnd(mp.Process):
             unc_cfg.get("log_keyframe_reasons", True)
         )
 
+        # M2-A: shadow-only propagation of absolute camera-pose uncertainty.
+        # It does not alter the baseline pose mean, losses, keyframes, mapping,
+        # densification, or deformation optimization.
+        self.m2a_enable = bool(unc_cfg.get("enable_m2a", False))
+        self.m2a_save_diagnostics = bool(
+            unc_cfg.get("m2a_save_diagnostics", True)
+        )
+        self.m2a_use_diag_calibration = bool(
+            unc_cfg.get("m2a_use_diag_calibration", False)
+        )
+        self.m2a_diag_calibration = unc_cfg.get(
+            "m2a_diag_calibration", None
+        )
+        self.m2a_right_jacobian_eps = float(
+            unc_cfg.get("m2a_right_jacobian_eps", 1.0e-5)
+        )
+
+        if self.m2a_enable and not self.m1_uncertainty:
+            Log(
+                "M2-A requested while M1 is disabled; M2-A propagation will "
+                "remain invalid until an M1 relative covariance is available.",
+                tag="Frontend",
+            )
+
         self.dynamic_objects = 0
 
     def set_hyperparams(self):
@@ -323,6 +352,19 @@ class FrontEnd(mp.Process):
         # Initialise the frame at the ground truth pose
         viewpoint.update_RT(viewpoint.R_gt, viewpoint.T_gt)
 
+        if self.m2a_enable:
+            # Frame 0 is explicitly initialized from GT by the baseline code,
+            # so its shadow covariance is anchored at zero.
+            viewpoint.pose_cov_abs_right.zero_()
+            viewpoint.pose_cov_abs_right_raw.zero_()
+            viewpoint.pose_cov_rel_right = torch.zeros(
+                (6, 6),
+                device=viewpoint.R.device,
+                dtype=viewpoint.R.dtype,
+            )
+            viewpoint.pose_cov_valid = True
+            viewpoint.pose_cov_source = "gt_anchor"
+
         self.kf_indices = []
         depth_map = self.add_new_keyframe(cur_frame_idx, init=True)
         self.request_init(cur_frame_idx, viewpoint, depth_map)
@@ -335,6 +377,10 @@ class FrontEnd(mp.Process):
         prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
         
         viewpoint.update_RT(prev.R, prev.T)
+        m2a_prior_pose = None
+        m2a_rel_right = None
+        m2a_abs_raw = None
+        m2a_abs_cal = None
         
         opt_params = []
         opt_params.append(
@@ -567,6 +613,88 @@ class FrontEnd(mp.Process):
                 viewpoint.R = T_curr[:3,:3]
                 viewpoint.T = T_curr[:3, 3]
 
+                if (
+                    self.m2a_enable
+                    and self.m1_uncertainty
+                    and m1_result is not None
+                ):
+                    # M1 returns covariance of the exponential-coordinate
+                    # parameter xi. Convert it to right-invariant relative
+                    # group-error covariance before recursive propagation.
+                    P_rel_param = m1_result["cov_cluster"]
+                    m2a_rel_right = relative_parameter_cov_to_right(
+                        xi,
+                        P_rel_param,
+                        eps=self.m2a_right_jacobian_eps,
+                    )
+
+                    P_prev_abs = prev.pose_cov_abs_right.to(
+                        device=T_rel.device, dtype=T_rel.dtype
+                    )
+                    P_prev_raw = prev.pose_cov_abs_right_raw.to(
+                        device=T_rel.device, dtype=T_rel.dtype
+                    )
+
+                    if prev.pose_cov_valid:
+                        m2a_abs_raw = propagate_right_pose_covariance(
+                            P_prev_raw,
+                            T_rel,
+                            m2a_rel_right,
+                        )
+                    else:
+                        # If a previous frame has no valid propagated state,
+                        # restart the shadow chain from the current relative
+                        # motion rather than injecting fabricated certainty.
+                        m2a_abs_raw = m2a_rel_right.clone()
+
+                    if (
+                        self.m2a_use_diag_calibration
+                        and self.m2a_diag_calibration is not None
+                    ):
+                        P_rel_for_abs = apply_whitened_diag_calibration(
+                            m2a_rel_right,
+                            self.m2a_diag_calibration,
+                        )
+                    else:
+                        P_rel_for_abs = m2a_rel_right
+
+                    if prev.pose_cov_valid:
+                        m2a_abs_cal = propagate_right_pose_covariance(
+                            P_prev_abs,
+                            T_rel,
+                            P_rel_for_abs,
+                        )
+                    else:
+                        m2a_abs_cal = P_rel_for_abs.clone()
+
+                    viewpoint.pose_cov_rel_right = (
+                        m2a_rel_right.detach().clone()
+                    )
+                    viewpoint.pose_cov_abs_right_raw = (
+                        m2a_abs_raw.detach().clone()
+                    )
+                    viewpoint.pose_cov_abs_right = (
+                        m2a_abs_cal.detach().clone()
+                    )
+                    viewpoint.pose_cov_valid = True
+                    viewpoint.pose_cov_source = (
+                        "cluster32+diag6"
+                        if (
+                            self.m2a_use_diag_calibration
+                            and self.m2a_diag_calibration is not None
+                        )
+                        else "cluster32_raw"
+                    )
+
+                    # Store the pose mean at which the motion prior was
+                    # propagated. Subsequent photometric tracking re-centres
+                    # the pose mean but does not change shadow covariance.
+                    m2a_prior_pose = torch.eye(
+                        4, device=T_curr.device, dtype=T_curr.dtype
+                    )
+                    m2a_prior_pose[:3, :3] = viewpoint.R
+                    m2a_prior_pose[:3, 3] = viewpoint.T
+
                 if self.m1_uncertainty and m1_result is not None:
                     # Keep the covariance tied to the raw GLS relative-pose
                     # estimate. The subsequent Flow4DGS motion cap is a
@@ -759,6 +887,101 @@ class FrontEnd(mp.Process):
                 break
 
         self.median_depth = get_median_depth(depth, opacity)
+
+        if self.m2a_enable and viewpoint.pose_cov_valid:
+            with torch.no_grad():
+                T_final = torch.eye(
+                    4, device=viewpoint.R.device, dtype=viewpoint.R.dtype
+                )
+                T_final[:3, :3] = viewpoint.R
+                T_final[:3, 3] = viewpoint.T
+
+                if m2a_prior_pose is not None:
+                    # Tracking pose optimization applies deterministic
+                    # left-multiplicative re-centering. Right-invariant
+                    # covariance is kept unchanged in M2-A shadow mode, but
+                    # the correction magnitude is logged for the later
+                    # tracking-information audit.
+                    T_corr = T_final @ torch.linalg.inv(m2a_prior_pose)
+                    corr_t = torch.linalg.norm(T_corr[:3, 3])
+                    corr_trace = torch.clamp(
+                        (torch.trace(T_corr[:3, :3]) - 1.0) / 2.0,
+                        -1.0,
+                        1.0,
+                    )
+                    corr_r = torch.acos(corr_trace)
+                else:
+                    corr_t = torch.tensor(
+                        float("nan"),
+                        device=T_final.device,
+                        dtype=T_final.dtype,
+                    )
+                    corr_r = corr_t.clone()
+
+                P_abs = viewpoint.pose_cov_abs_right
+                P_raw = viewpoint.pose_cov_abs_right_raw
+                eig_abs = torch.linalg.eigvalsh(
+                    0.5 * (P_abs + P_abs.T)
+                )
+                sigma_t_abs = torch.sqrt(
+                    torch.diagonal(P_abs)[:3].clamp_min(0.0)
+                )
+                sigma_r_abs = torch.sqrt(
+                    torch.diagonal(P_abs)[3:].clamp_min(0.0)
+                )
+
+                if self.m2a_save_diagnostics:
+                    m2_dir = os.path.join(
+                        self.config["Results"]["save_dir"],
+                        "m2a_pose_uncertainty",
+                    )
+                    os.makedirs(m2_dir, exist_ok=True)
+                    torch.save(
+                        {
+                            "frame": int(viewpoint.uid),
+                            "source": viewpoint.pose_cov_source,
+                            "P_abs_right": P_abs.detach().cpu(),
+                            "P_abs_right_raw": P_raw.detach().cpu(),
+                            "P_rel_right": (
+                                viewpoint.pose_cov_rel_right.detach().cpu()
+                                if viewpoint.pose_cov_rel_right is not None
+                                else None
+                            ),
+                            "T_final": T_final.detach().cpu(),
+                            "T_motion_prior": (
+                                m2a_prior_pose.detach().cpu()
+                                if m2a_prior_pose is not None
+                                else None
+                            ),
+                            "tracking_correction_translation_m": (
+                                corr_t.detach().cpu()
+                            ),
+                            "tracking_correction_rotation_rad": (
+                                corr_r.detach().cpu()
+                            ),
+                            "sigma_t_abs_m": sigma_t_abs.detach().cpu(),
+                            "sigma_r_abs_rad": sigma_r_abs.detach().cpu(),
+                            "eig_abs": eig_abs.detach().cpu(),
+                            "diag_calibration_enabled": bool(
+                                self.m2a_use_diag_calibration
+                                and self.m2a_diag_calibration is not None
+                            ),
+                        },
+                        os.path.join(
+                            m2_dir, f"{int(viewpoint.uid):06d}.pt"
+                        ),
+                    )
+
+                Log(
+                    "M2-A frame", viewpoint.uid,
+                    "source", viewpoint.pose_cov_source,
+                    "sigma_t_abs", sigma_t_abs.detach().cpu().tolist(),
+                    "sigma_r_abs", sigma_r_abs.detach().cpu().tolist(),
+                    "eig_min", float(eig_abs.min().detach().cpu()),
+                    "track_dt", float(corr_t.detach().cpu()),
+                    "track_dr", float(corr_r.detach().cpu()),
+                    tag="Frontend",
+                )
 
         
         
