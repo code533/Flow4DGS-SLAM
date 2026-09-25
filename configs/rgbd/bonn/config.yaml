@@ -144,4 +144,8 @@ Uncertainty:
   # Fill with six frozen Diag-6 entries from an external calibration split
   # before enabling calibrated M2-A propagation.
   m2a_diag_calibration: null
+  # Preferred M2-A1 path: load a frozen Diag-6 calibration report.
+  m2a_diag_calibration_file: null
+  # Required only when the report was generated in LOSO mode.
+  m2a_diag_calibration_fold: null
   m2a_right_jacobian_eps: 1.0e-5
