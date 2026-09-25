@@ -311,3 +311,50 @@ coverage, and Pearson/Spearman ranking metrics. If held-out NEES remains
 strongly sequence-dependent after this scale calibration, that is evidence for
 adding an explicit model-discrepancy term `Q_model` rather than further
 tuning the cluster block size.
+
+
+## Full whitened 6x6 calibration
+
+The cross-sequence calibration script now compares three models:
+
+```
+P_raw   = P_cluster
+P_scale = S P_cluster S^T
+P_full  = P_cluster^(1/2) C P_cluster^(1/2)
+```
+
+The full calibration is fitted on training sequences only:
+
+```
+z_i = P_i^(-1/2) e_i
+C   = mean_i z_i z_i^T
+```
+
+It can therefore correct anisotropic DoF scaling and translation-rotation
+coupling that the two-scalar baseline cannot represent.
+
+Example:
+
+```bash
+python scripts/calibrate_m1_multiseq.py \
+  --block-size 32 \
+  --train walking_static=/path/run1/m1_pose_uncertainty \
+          sitting_rpy=/path/run2/m1_pose_uncertainty \
+  --test bonn_placing=/path/run3/m1_pose_uncertainty \
+         sitting_static=/path/run4/m1_pose_uncertainty \
+  --output results/m1_calibration_block32_full.json
+```
+
+The script prints the learned dimensionless 6x6 matrix `C`, its eigenvalues,
+condition number, translation-rotation cross-block norm, and held-out metrics
+for raw, two-scale, and full-6x6 calibration.
+
+Optional regularization:
+
+```
+--full-shrinkage 0.1
+```
+
+shrinks `C` toward an isotropic matrix with the same trace. The default is
+zero shrinkage so that the first experiment directly tests whether covariance
+shape/cross-correlation calibration explains the remaining NEES gap.
