@@ -9,6 +9,9 @@ Conventions:
       J_pose = [-I, [X_w]_x].
 """
 
+import json
+from pathlib import Path
+
 import torch
 
 from utils.pose_utils import SE3_exp, skew_sym_mat
@@ -176,6 +179,71 @@ def world_point_covariance(
 
     Sigma = 0.5 * (Sigma + Sigma.transpose(1, 2))
     return X_w, Sigma
+
+
+def load_diag6_calibration_report(path, fold=None):
+    """Load a frozen Diag-6 calibration from an M1 calibration JSON report.
+
+    Supported report layouts:
+      1) explicit train/test calibration:
+           whitened_calibration -> variants -> diag -> C
+      2) LOSO calibration:
+           folds -> <held_out> -> calibration -> whitened
+                 -> variants -> diag -> C
+
+    For a LOSO report, `fold` is required. This makes the train/test boundary
+    explicit and helps prevent accidentally calibrating a sequence using its
+    own ground truth.
+    """
+    report_path = Path(path).expanduser()
+    data = json.loads(report_path.read_text(encoding="utf-8"))
+
+    if data.get("mode") == "loso" or "folds" in data:
+        if fold is None:
+            raise ValueError(
+                "A LOSO calibration report requires "
+                "m2a_diag_calibration_fold=<held-out sequence name>."
+            )
+        folds = data.get("folds", {})
+        if fold not in folds:
+            raise KeyError(
+                f"Fold {fold!r} not found in {report_path}. "
+                f"Available folds: {sorted(folds.keys())}"
+            )
+        node = folds[fold]["calibration"]["whitened"]["variants"]["diag"]
+        train_sequences = list(folds[fold].get("train_sequences", []))
+        source = f"{report_path}:fold={fold}"
+    else:
+        node = data["whitened_calibration"]["variants"]["diag"]
+        train_sequences = list(data.get("train_sequences", {}).keys())
+        source = str(report_path)
+
+    C = torch.as_tensor(node["C"], dtype=torch.float64)
+    if C.shape != (6, 6):
+        raise ValueError(
+            f"Diag-6 calibration matrix must be 6x6, got {tuple(C.shape)}"
+        )
+    if not bool(torch.isfinite(C).all()):
+        raise ValueError("Diag-6 calibration matrix contains non-finite values")
+
+    offdiag = C - torch.diag(torch.diagonal(C))
+    if float(offdiag.abs().max()) > 1e-8:
+        raise ValueError(
+            "Requested Diag-6 calibration contains non-zero off-diagonal "
+            "entries; refuse to silently use a different covariance model."
+        )
+
+    diag = torch.diagonal(C).clone()
+    if bool((diag <= 0).any()):
+        raise ValueError("Diag-6 calibration entries must be positive")
+
+    return {
+        "diag": diag.tolist(),
+        "source": source,
+        "block_size": int(data.get("block_size", -1)),
+        "train_sequences": train_sequences,
+        "held_out": fold,
+    }
 
 
 def symmetric_psd_sqrt(P, eig_floor_rel=1e-12):
