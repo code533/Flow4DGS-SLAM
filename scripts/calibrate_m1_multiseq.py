@@ -1,28 +1,33 @@
 #!/usr/bin/env python3
 """Cross-sequence calibration for M1 pose covariance.
 
+This script compares three covariance models on exactly the same M1 outputs:
+
+1. raw:
+       P_raw = P_cluster
+
+2. translation/rotation scale baseline:
+       P_scale = S P_cluster S^T
+       S = diag(s_t, s_t, s_t, s_r, s_r, s_r)
+
+3. full whitened 6x6 second-moment calibration:
+       z_i = P_i^{-1/2} e_i
+       C   = mean_i z_i z_i^T
+       P_full,i = P_i^{1/2} C P_i^{1/2}
+
+The full model can correct anisotropy and translation-rotation coupling that a
+two-scalar scale model cannot represent. All calibration parameters are fitted
+only on the training sequences and evaluated unchanged on held-out sequences.
+
 Example:
 
     python scripts/calibrate_m1_multiseq.py \
         --block-size 32 \
         --train walking_xyz=/path/run1/m1_pose_uncertainty \
-                sitting_static=/path/run2/m1_pose_uncertainty \
+                sitting_rpy=/path/run2/m1_pose_uncertainty \
         --test bonn_placing=/path/run3/m1_pose_uncertainty \
-               sitting_rpy=/path/run4/m1_pose_uncertainty \
+               sitting_static=/path/run4/m1_pose_uncertainty \
         --output results/m1_calibration_block32.json
-
-The calibration model is
-
-    P_cal = S P S^T,
-    S = diag(s_t, s_t, s_t, s_r, s_r, s_r).
-
-s_t and s_r are fitted only on the training sequences by matching the mean
-translation- and rotation-marginal NEES to their expected 3-DoF value.
-
-This script intentionally keeps the calibration model simple. It is meant to
-answer whether a sequence-independent translation/rotation scale can make the
-correlation-aware M1 covariance transferable before introducing any additional
-model-discrepancy term Q_model.
 """
 
 import argparse
@@ -122,8 +127,32 @@ def select_covariance(data, block_size):
     )
 
 
+def symmetrize(P):
+    return 0.5 * (P + P.T)
+
+
+def spd_eigendecomposition(P, eig_floor_rel=1e-10):
+    """Return a numerically SPD eigendecomposition of a symmetric matrix."""
+    P = symmetrize(P)
+    eig, vec = torch.linalg.eigh(P)
+    max_eig = eig.max().clamp_min(1e-18)
+    floor = max_eig * eig_floor_rel
+    eig = eig.clamp_min(floor)
+    return eig, vec
+
+
+def symmetric_sqrt_and_inv(P, eig_floor_rel=1e-10):
+    """Symmetric square root and inverse square root of a PSD covariance."""
+    eig, vec = spd_eigendecomposition(P, eig_floor_rel=eig_floor_rel)
+    sqrt_eig = torch.sqrt(eig)
+    inv_sqrt_eig = 1.0 / sqrt_eig
+    root = (vec * sqrt_eig.unsqueeze(0)) @ vec.T
+    inv_root = (vec * inv_sqrt_eig.unsqueeze(0)) @ vec.T
+    return symmetrize(root), symmetrize(inv_root)
+
+
 def stable_nees(err, P):
-    P = 0.5 * (P + P.T)
+    P = symmetrize(P)
     try:
         return float(err @ torch.linalg.solve(P, err))
     except RuntimeError:
@@ -150,7 +179,7 @@ def load_sequence(name, directory, block_size):
         xi_gt = se3_log(data["T_rel_gt"].double())
         err = xi_est - xi_gt
 
-        P = 0.5 * (P + P.T)
+        P = symmetrize(P)
         if not bool(torch.isfinite(P).all()):
             continue
 
@@ -182,6 +211,7 @@ def marginal_nees(sample, sl):
 
 
 def fit_scales(samples):
+    """Fit the two-scalar translation/rotation baseline calibration."""
     if not samples:
         raise ValueError("No training samples")
 
@@ -194,7 +224,8 @@ def fit_scales(samples):
         dtype=torch.float64,
     )
 
-    # For P' = s^2 P, marginal NEES scales as 1/s^2.
+    # For P' = S P S^T with an isotropic scale inside each 3D block,
+    # marginal NEES scales as 1/s^2.
     alpha_t = max(float(nees_t.mean() / 3.0), 1e-12)
     alpha_r = max(float(nees_r.mean() / 3.0), 1e-12)
     s_t = math.sqrt(alpha_t)
@@ -210,14 +241,87 @@ def fit_scales(samples):
     }
 
 
-def scale_covariance(P, s_t, s_r):
+def scale_covariance(P, scales):
+    s_t = scales["s_t"]
+    s_r = scales["s_r"]
     S = torch.diag(
         torch.tensor(
             [s_t, s_t, s_t, s_r, s_r, s_r],
             dtype=P.dtype,
         )
     )
-    return S @ P @ S
+    return symmetrize(S @ P @ S)
+
+
+def fit_full_whitened(samples, shrinkage=0.0, eig_floor_rel=1e-10):
+    """Fit a dimensionless 6x6 whitened error second-moment matrix.
+
+    For each raw covariance P_i and parameter error e_i:
+
+        z_i = P_i^{-1/2} e_i
+
+    The empirical second moment
+
+        C = mean_i z_i z_i^T
+
+    is then used to construct
+
+        P_cal,i = P_i^{1/2} C P_i^{1/2}.
+
+    Optional shrinkage is toward an isotropic matrix with the same trace, so
+    it regularizes covariance shape without destroying the global scale.
+    """
+    if not samples:
+        raise ValueError("No training samples")
+
+    zs = []
+    for sample in samples:
+        _, inv_root = symmetric_sqrt_and_inv(
+            sample["P"], eig_floor_rel=eig_floor_rel
+        )
+        zs.append(inv_root @ sample["error"])
+
+    Z = torch.stack(zs, dim=0)
+    mean_z = Z.mean(dim=0)
+    C_emp = (Z.T @ Z) / float(Z.shape[0])
+    C_emp = symmetrize(C_emp)
+
+    shrinkage = float(shrinkage)
+    if not (0.0 <= shrinkage < 1.0):
+        raise ValueError("--full-shrinkage must be in [0, 1)")
+
+    mean_variance = torch.trace(C_emp) / 6.0
+    C_target = mean_variance * torch.eye(6, dtype=C_emp.dtype)
+    C = (1.0 - shrinkage) * C_emp + shrinkage * C_target
+    C = symmetrize(C)
+
+    eig, vec = spd_eigendecomposition(C, eig_floor_rel=eig_floor_rel)
+    C = (vec * eig.unsqueeze(0)) @ vec.T
+    C = symmetrize(C)
+
+    condition = float(eig.max() / eig.min())
+    cross = C[:3, 3:]
+    diag_t = torch.diagonal(C[:3, :3])
+    diag_r = torch.diagonal(C[3:, 3:])
+
+    return {
+        "C": C,
+        "C_empirical": C_emp,
+        "mean_z": mean_z,
+        "eigenvalues": eig,
+        "condition": condition,
+        "shrinkage": shrinkage,
+        "trace": float(torch.trace(C)),
+        "cross_frobenius": float(torch.linalg.norm(cross)),
+        "diag_t": diag_t,
+        "diag_r": diag_r,
+    }
+
+
+def full_whitened_covariance(P, full_calibration, eig_floor_rel=1e-10):
+    root, _ = symmetric_sqrt_and_inv(P, eig_floor_rel=eig_floor_rel)
+    C = full_calibration["C"].to(dtype=P.dtype)
+    return symmetrize(root @ C @ root)
 
 
 def covariance_sigma(P, sl):
@@ -257,7 +361,20 @@ def spearman(x, y):
     return pearson(rankdata(x), rankdata(y))
 
 
-def summarize(samples, s_t=1.0, s_r=1.0):
+def calibrated_covariance(sample, mode, scales=None, full=None, eig_floor_rel=1e-10):
+    P = sample["P"]
+    if mode == "raw":
+        return P
+    if mode == "scale":
+        return scale_covariance(P, scales)
+    if mode == "full":
+        return full_whitened_covariance(
+            P, full, eig_floor_rel=eig_floor_rel
+        )
+    raise ValueError(f"Unknown calibration mode: {mode}")
+
+
+def summarize(samples, mode="raw", scales=None, full=None, eig_floor_rel=1e-10):
     nees6 = []
     nees_t = []
     nees_r = []
@@ -267,7 +384,13 @@ def summarize(samples, s_t=1.0, s_r=1.0):
     err_r = []
 
     for sample in samples:
-        P = scale_covariance(sample["P"], s_t, s_r)
+        P = calibrated_covariance(
+            sample,
+            mode,
+            scales=scales,
+            full=full,
+            eig_floor_rel=eig_floor_rel,
+        )
         err = sample["error"]
 
         nees6.append(stable_nees(err, P))
@@ -337,26 +460,44 @@ def print_metrics(label, metrics):
     )
 
 
-def evaluate_split(sequence_samples, scales):
+def evaluate_split(sequence_samples, scales, full, eig_floor_rel):
     pooled = [s for samples in sequence_samples.values() for s in samples]
 
     result = {
-        "pooled_raw": summarize(pooled),
-        "pooled_calibrated": summarize(
-            pooled, scales["s_t"], scales["s_r"]
-        ),
+        "pooled": {
+            "raw": summarize(pooled, mode="raw"),
+            "scale": summarize(
+                pooled, mode="scale", scales=scales
+            ),
+            "full": summarize(
+                pooled,
+                mode="full",
+                full=full,
+                eig_floor_rel=eig_floor_rel,
+            ),
+        },
         "per_sequence": {},
     }
 
     for name, samples in sequence_samples.items():
         result["per_sequence"][name] = {
-            "raw": summarize(samples),
-            "calibrated": summarize(
-                samples, scales["s_t"], scales["s_r"]
+            "raw": summarize(samples, mode="raw"),
+            "scale": summarize(
+                samples, mode="scale", scales=scales
+            ),
+            "full": summarize(
+                samples,
+                mode="full",
+                full=full,
+                eig_floor_rel=eig_floor_rel,
             ),
         }
 
     return result
+
+
+def tensor_to_list(x):
+    return x.detach().cpu().tolist()
 
 
 def main():
@@ -380,6 +521,21 @@ def main():
         type=int,
         default=32,
         help="Cluster covariance block size to calibrate.",
+    )
+    parser.add_argument(
+        "--full-shrinkage",
+        type=float,
+        default=0.0,
+        help=(
+            "Shrink full 6x6 whitened second moment toward an isotropic "
+            "matrix with the same trace. Default: 0 (no shrinkage)."
+        ),
+    )
+    parser.add_argument(
+        "--eig-floor-rel",
+        type=float,
+        default=1e-10,
+        help="Relative eigenvalue floor used for stable matrix roots.",
     )
     parser.add_argument(
         "--output",
@@ -415,56 +571,121 @@ def main():
     train_pooled = [
         s for samples in train_sequences.values() for s in samples
     ]
-    scales = fit_scales(train_pooled)
 
-    print("=" * 72)
+    scales = fit_scales(train_pooled)
+    full = fit_full_whitened(
+        train_pooled,
+        shrinkage=args.full_shrinkage,
+        eig_floor_rel=args.eig_floor_rel,
+    )
+
+    print("=" * 76)
     print("M1 cross-sequence covariance calibration")
-    print("=" * 72)
+    print("=" * 76)
     print(f"block size: {args.block_size}x{args.block_size}")
     print("training sequences: " + ", ".join(train_sequences))
     print("test sequences: " + (", ".join(test_sequences) or "(none)"))
+
     print(
-        "\nfitted calibration:"
+        "\nTwo-scale baseline:"
         f"\n  s_t={scales['s_t']:.6g}"
         f"  (alpha_t=s_t^2={scales['alpha_t']:.6g})"
         f"\n  s_r={scales['s_r']:.6g}"
         f"  (alpha_r=s_r^2={scales['alpha_r']:.6g})"
     )
 
-    train_eval = evaluate_split(train_sequences, scales)
-    print_metrics("TRAIN pooled raw", train_eval["pooled_raw"])
-    print_metrics(
-        "TRAIN pooled calibrated", train_eval["pooled_calibrated"]
+    print("\nFull whitened 6x6 calibration:")
+    print(f"  shrinkage={full['shrinkage']:.6g}")
+    print(f"  trace(C)={full['trace']:.6g}")
+    print(f"  cond(C)={full['condition']:.6g}")
+    print(f"  ||C_tr||_F={full['cross_frobenius']:.6g}")
+    print(
+        "  mean whitened error="
+        + str([round(float(v), 6) for v in full["mean_z"]])
     )
+    print(
+        "  eig(C)="
+        + str([round(float(v), 6) for v in full["eigenvalues"]])
+    )
+    print("  C=")
+    for row in full["C"]:
+        print("   ", " ".join(f"{float(v):12.5g}" for v in row))
+
+    train_eval = evaluate_split(
+        train_sequences, scales, full, args.eig_floor_rel
+    )
+
+    print_metrics("TRAIN pooled raw", train_eval["pooled"]["raw"])
+    print_metrics(
+        "TRAIN pooled two-scale", train_eval["pooled"]["scale"]
+    )
+    print_metrics(
+        "TRAIN pooled full-6x6", train_eval["pooled"]["full"]
+    )
+
     for name, metrics in train_eval["per_sequence"].items():
         print_metrics(
-            f"TRAIN {name} calibrated", metrics["calibrated"]
+            f"TRAIN {name} two-scale", metrics["scale"]
+        )
+        print_metrics(
+            f"TRAIN {name} full-6x6", metrics["full"]
         )
 
     test_eval = None
     if test_sequences:
-        test_eval = evaluate_split(test_sequences, scales)
-        print_metrics("TEST pooled raw", test_eval["pooled_raw"])
-        print_metrics(
-            "TEST pooled calibrated", test_eval["pooled_calibrated"]
+        test_eval = evaluate_split(
+            test_sequences, scales, full, args.eig_floor_rel
         )
+        print_metrics("TEST pooled raw", test_eval["pooled"]["raw"])
+        print_metrics(
+            "TEST pooled two-scale", test_eval["pooled"]["scale"]
+        )
+        print_metrics(
+            "TEST pooled full-6x6", test_eval["pooled"]["full"]
+        )
+
         for name, metrics in test_eval["per_sequence"].items():
             print_metrics(
-                f"TEST {name} calibrated", metrics["calibrated"]
+                f"TEST {name} two-scale", metrics["scale"]
+            )
+            print_metrics(
+                f"TEST {name} full-6x6", metrics["full"]
             )
 
     output = {
         "block_size": args.block_size,
-        "model": "P_cal = S P_cluster S^T",
-        "S_diagonal": [
-            scales["s_t"],
-            scales["s_t"],
-            scales["s_t"],
-            scales["s_r"],
-            scales["s_r"],
-            scales["s_r"],
-        ],
-        "calibration": scales,
+        "models": {
+            "raw": "P_raw = P_cluster",
+            "two_scale": "P_scale = S P_cluster S^T",
+            "full_whitened": (
+                "z=P^{-1/2}e; C=E[zz^T]; "
+                "P_full=P^{1/2} C P^{1/2}"
+            ),
+        },
+        "two_scale_calibration": {
+            **scales,
+            "S_diagonal": [
+                scales["s_t"],
+                scales["s_t"],
+                scales["s_t"],
+                scales["s_r"],
+                scales["s_r"],
+                scales["s_r"],
+            ],
+        },
+        "full_whitened_calibration": {
+            "C": tensor_to_list(full["C"]),
+            "C_empirical": tensor_to_list(full["C_empirical"]),
+            "mean_z": tensor_to_list(full["mean_z"]),
+            "eigenvalues": tensor_to_list(full["eigenvalues"]),
+            "condition": full["condition"],
+            "shrinkage": full["shrinkage"],
+            "trace": full["trace"],
+            "cross_frobenius": full["cross_frobenius"],
+            "diag_t": tensor_to_list(full["diag_t"]),
+            "diag_r": tensor_to_list(full["diag_r"]),
+            "eig_floor_rel": args.eig_floor_rel,
+        },
         "train_sequences": {
             name: str(path) for name, path in train_specs
         },
