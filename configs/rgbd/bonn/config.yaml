@@ -149,3 +149,16 @@ Uncertainty:
   # Required only when the report was generated in LOSO mode.
   m2a_diag_calibration_fold: null
   m2a_right_jacobian_eps: 1.0e-5
+
+  # M2-A2 tracking posterior covariance. Disabled by default because the
+  # finite-difference audit performs 12 extra static renders per frame.
+  enable_m2a2: false
+  m2a2_save_diagnostics: true
+  m2a2_cluster_block_size: 32
+  m2a2_translation_eps: 1.0e-4
+  m2a2_rotation_eps: 1.0e-4
+  m2a2_cauchy_c: 2.0
+  m2a2_damping: 1.0e-6
+  m2a2_information_scale: 1.0
+  m2a2_rgb_scale_floor: 0.01
+  m2a2_depth_scale_floor: 0.01
