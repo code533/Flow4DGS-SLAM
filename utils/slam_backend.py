@@ -397,6 +397,7 @@ def fit_twist_probabilistic(
     min_pixels=500,
     cluster_covariance=True,
     cluster_block_size=32,
+    cluster_block_sizes=None,
     cluster_small_sample_correction=True,
     fixed_xi=None,
 ):
@@ -420,6 +421,9 @@ def fit_twist_probabilistic(
         valid_mask: [H,W] candidate static pixels.
         flow_var_px2: [H,W] isotropic per-component flow variance.
         depth_var_m2: [H,W] depth variance in meter^2.
+        cluster_block_sizes: optional iterable of additional spatial block
+            sizes. All requested sandwich covariances are computed from the
+            same final residual/score field in one pass through tracking.
         fixed_xi: optional [6] baseline twist. When provided, M1 runs in
             strict shadow mode: the pose mean is not re-estimated and the
             covariance is evaluated around this fixed baseline estimate.
@@ -462,11 +466,24 @@ def fit_twist_probabilistic(
         else:
             xi = fixed_xi.detach().to(device=device, dtype=dtype)
         huge_cov = torch.eye(6, device=device, dtype=dtype) * 1e3
+        if cluster_block_sizes is None:
+            requested_block_sizes = [int(cluster_block_size)]
+        else:
+            requested_block_sizes = sorted({
+                max(int(bs), 1) for bs in cluster_block_sizes
+            } | {max(int(cluster_block_size), 1)})
         return {
             "xi": xi,
             "cov": huge_cov,
             "cov_hessian": huge_cov.clone(),
             "cov_cluster": huge_cov.clone(),
+            "cov_clusters": {
+                int(bs): huge_cov.clone() for bs in requested_block_sizes
+            },
+            "cluster_counts": {
+                int(bs): 0 for bs in requested_block_sizes
+            },
+            "cluster_block_sizes": requested_block_sizes,
             "information": torch.zeros((6, 6), device=device, dtype=dtype),
             "maha_map": torch.zeros((H, W), device=device, dtype=dtype),
             "kappa": torch.tensor(float("inf"), device=device, dtype=dtype),
@@ -574,47 +591,74 @@ def fit_twist_probabilistic(
     # Spatial cluster-robust sandwich covariance:
     #   P_CR = A^{-1} (sum_b S_b S_b^T) A^{-1}
     # where S_b is the sum of per-pixel estimating-equation scores inside
-    # one image block. This allows arbitrary residual correlation within each
-    # block and avoids treating every dense-flow pixel as independent.
-    block_size = max(int(cluster_block_size), 1)
-    valid_y, valid_x = torch.where(valid)
-    n_blocks_x = (W + block_size - 1) // block_size
-    n_blocks_y = (H + block_size - 1) // block_size
-    n_blocks_total = n_blocks_x * n_blocks_y
-    cluster_id = (valid_y // block_size) * n_blocks_x + (valid_x // block_size)
+    # one image block. Multiple block sizes can be evaluated from the same
+    # final pixel-score field, so block-size ablation does not require
+    # rerunning the SLAM trajectory.
+    selected_block_size = max(int(cluster_block_size), 1)
+    if cluster_block_sizes is None:
+        requested_block_sizes = [selected_block_size]
+    else:
+        requested_block_sizes = sorted({
+            max(int(bs), 1) for bs in cluster_block_sizes
+        } | {selected_block_size})
 
-    # Score for each pixel: J_p^T W_p r_p. The sign of residual is irrelevant
-    # for the outer product used by the sandwich "meat".
+    valid_y, valid_x = torch.where(valid)
+
+    # Score for each pixel: J_p^T W_p r_p. The sign is irrelevant for the
+    # outer products used by the sandwich "meat".
     pixel_score = torch.einsum(
         "nai,nab,nb->ni", Lv, Wn, residual
     )
-    cluster_score = torch.zeros(
-        (n_blocks_total, 6), device=device, dtype=dtype
-    )
-    cluster_score.index_add_(0, cluster_id, pixel_score)
 
-    active = cluster_score.abs().sum(dim=1) > 0
-    cluster_score = cluster_score[active]
-    cluster_count = int(cluster_score.shape[0])
+    def compute_cluster_covariance(block_size_now):
+        n_blocks_x = (W + block_size_now - 1) // block_size_now
+        n_blocks_y = (H + block_size_now - 1) // block_size_now
+        n_blocks_total = n_blocks_x * n_blocks_y
+        cluster_id = (
+            (valid_y // block_size_now) * n_blocks_x
+            + (valid_x // block_size_now)
+        )
 
-    if cluster_count >= 2:
+        cluster_score = torch.zeros(
+            (n_blocks_total, 6), device=device, dtype=dtype
+        )
+        cluster_score.index_add_(0, cluster_id, pixel_score)
+
+        active = cluster_score.abs().sum(dim=1) > 0
+        cluster_score = cluster_score[active]
+        count = int(cluster_score.shape[0])
+
+        if count < 2:
+            return cov_hessian.clone(), count
+
         meat = cluster_score.T @ cluster_score
         correction = 1.0
         if cluster_small_sample_correction and num_pixels > 6:
             correction = (
-                (cluster_count / float(cluster_count - 1))
+                (count / float(count - 1))
                 * ((num_pixels - 1) / float(num_pixels - 6))
             )
-        cov_cluster = correction * (bread_inv @ meat @ bread_inv)
-        cov_cluster = 0.5 * (cov_cluster + cov_cluster.T)
+
+        cov_now = correction * (bread_inv @ meat @ bread_inv)
+        cov_now = 0.5 * (cov_now + cov_now.T)
 
         # Numerical PSD projection; sandwich covariance is PSD analytically.
-        ceig, cvec = torch.linalg.eigh(cov_cluster)
+        ceig, cvec = torch.linalg.eigh(cov_now)
         ceig = ceig.clamp_min(0.0)
-        cov_cluster = (cvec * ceig.unsqueeze(0)) @ cvec.T
-        cov_cluster = 0.5 * (cov_cluster + cov_cluster.T)
-    else:
-        cov_cluster = cov_hessian.clone()
+        cov_now = (cvec * ceig.unsqueeze(0)) @ cvec.T
+        cov_now = 0.5 * (cov_now + cov_now.T)
+        return cov_now, count
+
+    cov_clusters = {}
+    cluster_counts = {}
+    for bs in requested_block_sizes:
+        cov_bs, count_bs = compute_cluster_covariance(bs)
+        cov_clusters[int(bs)] = cov_bs
+        cluster_counts[int(bs)] = int(count_bs)
+
+    cov_cluster = cov_clusters[selected_block_size]
+    cluster_count = cluster_counts[selected_block_size]
+    block_size = selected_block_size
 
     if cluster_covariance and cluster_count >= 2:
         cov = cov_cluster
@@ -634,6 +678,9 @@ def fit_twist_probabilistic(
         "cov": cov,
         "cov_hessian": cov_hessian,
         "cov_cluster": cov_cluster,
+        "cov_clusters": cov_clusters,
+        "cluster_counts": cluster_counts,
+        "cluster_block_sizes": requested_block_sizes,
         "information": Hmat,
         "maha_map": maha_map,
         "kappa": kappa,
