@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Cross-sequence calibration for M1 pose covariance.
 
-This script compares three covariance models on exactly the same M1 outputs:
+This script compares five covariance models on exactly the same M1 outputs:
 
 1. raw:
        P_raw = P_cluster
@@ -10,13 +10,23 @@ This script compares three covariance models on exactly the same M1 outputs:
        P_scale = S P_cluster S^T
        S = diag(s_t, s_t, s_t, s_r, s_r, s_r)
 
-3. full whitened 6x6 second-moment calibration:
+3. diagonal whitened calibration:
+       C_diag = diag(diag(C))
+
+4. block-diagonal whitened calibration:
+       C_block = blockdiag(C_tt, C_rr)
+
+5. full whitened 6x6 calibration:
+       C_full = C
+
+where
        z_i = P_i^{-1/2} e_i
        C   = mean_i z_i z_i^T
-       P_full,i = P_i^{1/2} C P_i^{1/2}
+       P_cal,i = P_i^{1/2} C_* P_i^{1/2}.
 
-The full model can correct anisotropy and translation-rotation coupling that a
-two-scalar scale model cannot represent. All calibration parameters are fitted
+The structured ablation isolates whether held-out improvements come from
+per-DoF anisotropic scaling, within-translation/within-rotation coupling, or
+translation-rotation cross coupling. All calibration parameters are fitted
 only on the training sequences and evaluated unchanged on held-out sequences.
 
 Example:
@@ -318,9 +328,44 @@ def fit_full_whitened(samples, shrinkage=0.0, eig_floor_rel=1e-10):
     }
 
 
-def full_whitened_covariance(P, full_calibration, eig_floor_rel=1e-10):
+def derive_structured_whitened_calibrations(full_calibration):
+    """Derive diag-6 and block-6 variants from the fitted full C matrix.
+
+    All structures are defined in the whitened error space:
+      diag-6:  keep only six marginal second moments.
+      block-6: keep C_tt and C_rr, zero C_tr/C_rt.
+      full-6:  retain the complete fitted matrix.
+    """
+    C_full = full_calibration["C"].clone()
+
+    C_diag = torch.diag(torch.diagonal(C_full))
+
+    C_block = torch.zeros_like(C_full)
+    C_block[:3, :3] = C_full[:3, :3]
+    C_block[3:, 3:] = C_full[3:, 3:]
+    C_block = symmetrize(C_block)
+
+    def describe(C):
+        eig = torch.linalg.eigvalsh(C)
+        eig = eig.clamp_min(1e-18)
+        return {
+            "C": C,
+            "eigenvalues": eig,
+            "condition": float(eig.max() / eig.min()),
+            "trace": float(torch.trace(C)),
+            "cross_frobenius": float(torch.linalg.norm(C[:3, 3:])),
+        }
+
+    return {
+        "diag": describe(C_diag),
+        "block": describe(C_block),
+        "full": describe(C_full),
+    }
+
+
+def whitened_covariance(P, calibration, eig_floor_rel=1e-10):
     root, _ = symmetric_sqrt_and_inv(P, eig_floor_rel=eig_floor_rel)
-    C = full_calibration["C"].to(dtype=P.dtype)
+    C = calibration["C"].to(dtype=P.dtype)
     return symmetrize(root @ C @ root)
 
 
@@ -361,20 +406,34 @@ def spearman(x, y):
     return pearson(rankdata(x), rankdata(y))
 
 
-def calibrated_covariance(sample, mode, scales=None, full=None, eig_floor_rel=1e-10):
+def calibrated_covariance(
+    sample,
+    mode,
+    scales=None,
+    structured=None,
+    eig_floor_rel=1e-10,
+):
     P = sample["P"]
     if mode == "raw":
         return P
     if mode == "scale":
         return scale_covariance(P, scales)
-    if mode == "full":
-        return full_whitened_covariance(
-            P, full, eig_floor_rel=eig_floor_rel
+    if mode in {"diag", "block", "full"}:
+        return whitened_covariance(
+            P,
+            structured[mode],
+            eig_floor_rel=eig_floor_rel,
         )
     raise ValueError(f"Unknown calibration mode: {mode}")
 
 
-def summarize(samples, mode="raw", scales=None, full=None, eig_floor_rel=1e-10):
+def summarize(
+    samples,
+    mode="raw",
+    scales=None,
+    structured=None,
+    eig_floor_rel=1e-10,
+):
     nees6 = []
     nees_t = []
     nees_r = []
@@ -388,7 +447,7 @@ def summarize(samples, mode="raw", scales=None, full=None, eig_floor_rel=1e-10):
             sample,
             mode,
             scales=scales,
-            full=full,
+            structured=structured,
             eig_floor_rel=eig_floor_rel,
         )
         err = sample["error"]
@@ -460,38 +519,40 @@ def print_metrics(label, metrics):
     )
 
 
-def evaluate_split(sequence_samples, scales, full, eig_floor_rel):
+def evaluate_split(sequence_samples, scales, structured, eig_floor_rel):
     pooled = [s for samples in sequence_samples.values() for s in samples]
 
-    result = {
-        "pooled": {
-            "raw": summarize(pooled, mode="raw"),
-            "scale": summarize(
-                pooled, mode="scale", scales=scales
-            ),
-            "full": summarize(
-                pooled,
-                mode="full",
-                full=full,
+    def evaluate_samples(samples):
+        return {
+            "raw": summarize(samples, mode="raw"),
+            "scale": summarize(samples, mode="scale", scales=scales),
+            "diag": summarize(
+                samples,
+                mode="diag",
+                structured=structured,
                 eig_floor_rel=eig_floor_rel,
             ),
-        },
-        "per_sequence": {},
-    }
-
-    for name, samples in sequence_samples.items():
-        result["per_sequence"][name] = {
-            "raw": summarize(samples, mode="raw"),
-            "scale": summarize(
-                samples, mode="scale", scales=scales
+            "block": summarize(
+                samples,
+                mode="block",
+                structured=structured,
+                eig_floor_rel=eig_floor_rel,
             ),
             "full": summarize(
                 samples,
                 mode="full",
-                full=full,
+                structured=structured,
                 eig_floor_rel=eig_floor_rel,
             ),
         }
+
+    result = {
+        "pooled": evaluate_samples(pooled),
+        "per_sequence": {},
+    }
+
+    for name, samples in sequence_samples.items():
+        result["per_sequence"][name] = evaluate_samples(samples)
 
     return result
 
@@ -578,6 +639,7 @@ def main():
         shrinkage=args.full_shrinkage,
         eig_floor_rel=args.eig_floor_rel,
     )
+    structured = derive_structured_whitened_calibrations(full)
 
     print("=" * 76)
     print("M1 cross-sequence covariance calibration")
@@ -594,25 +656,34 @@ def main():
         f"  (alpha_r=s_r^2={scales['alpha_r']:.6g})"
     )
 
-    print("\nFull whitened 6x6 calibration:")
+    print("\nWhitened 6x6 calibration family:")
     print(f"  shrinkage={full['shrinkage']:.6g}")
-    print(f"  trace(C)={full['trace']:.6g}")
-    print(f"  cond(C)={full['condition']:.6g}")
-    print(f"  ||C_tr||_F={full['cross_frobenius']:.6g}")
     print(
         "  mean whitened error="
         + str([round(float(v), 6) for v in full["mean_z"]])
     )
-    print(
-        "  eig(C)="
-        + str([round(float(v), 6) for v in full["eigenvalues"]])
-    )
-    print("  C=")
-    for row in full["C"]:
+    for mode, label in [
+        ("diag", "Diag-6"),
+        ("block", "Block-6"),
+        ("full", "Full-6"),
+    ]:
+        info = structured[mode]
+        print(
+            f"  {label}: trace={info['trace']:.6g}, "
+            f"cond={info['condition']:.6g}, "
+            f"||C_tr||_F={info['cross_frobenius']:.6g}"
+        )
+        print(
+            "    eig="
+            + str([round(float(v), 6) for v in info["eigenvalues"]])
+        )
+
+    print("  Full-6 C=")
+    for row in structured["full"]["C"]:
         print("   ", " ".join(f"{float(v):12.5g}" for v in row))
 
     train_eval = evaluate_split(
-        train_sequences, scales, full, args.eig_floor_rel
+        train_sequences, scales, structured, args.eig_floor_rel
     )
 
     print_metrics("TRAIN pooled raw", train_eval["pooled"]["raw"])
@@ -620,43 +691,67 @@ def main():
         "TRAIN pooled two-scale", train_eval["pooled"]["scale"]
     )
     print_metrics(
+        "TRAIN pooled diag-6", train_eval["pooled"]["diag"]
+    )
+    print_metrics(
+        "TRAIN pooled block-6", train_eval["pooled"]["block"]
+    )
+    print_metrics(
         "TRAIN pooled full-6x6", train_eval["pooled"]["full"]
     )
 
     for name, metrics in train_eval["per_sequence"].items():
-        print_metrics(
-            f"TRAIN {name} two-scale", metrics["scale"]
-        )
-        print_metrics(
-            f"TRAIN {name} full-6x6", metrics["full"]
-        )
+        for mode, label in [
+            ("scale", "two-scale"),
+            ("diag", "diag-6"),
+            ("block", "block-6"),
+            ("full", "full-6x6"),
+        ]:
+            print_metrics(
+                f"TRAIN {name} {label}", metrics[mode]
+            )
 
     test_eval = None
     if test_sequences:
         test_eval = evaluate_split(
-            test_sequences, scales, full, args.eig_floor_rel
+            test_sequences, scales, structured, args.eig_floor_rel
         )
         print_metrics("TEST pooled raw", test_eval["pooled"]["raw"])
         print_metrics(
             "TEST pooled two-scale", test_eval["pooled"]["scale"]
         )
         print_metrics(
+            "TEST pooled diag-6", test_eval["pooled"]["diag"]
+        )
+        print_metrics(
+            "TEST pooled block-6", test_eval["pooled"]["block"]
+        )
+        print_metrics(
             "TEST pooled full-6x6", test_eval["pooled"]["full"]
         )
 
         for name, metrics in test_eval["per_sequence"].items():
-            print_metrics(
-                f"TEST {name} two-scale", metrics["scale"]
-            )
-            print_metrics(
-                f"TEST {name} full-6x6", metrics["full"]
-            )
+            for mode, label in [
+                ("scale", "two-scale"),
+                ("diag", "diag-6"),
+                ("block", "block-6"),
+                ("full", "full-6x6"),
+            ]:
+                print_metrics(
+                    f"TEST {name} {label}", metrics[mode]
+                )
 
     output = {
         "block_size": args.block_size,
         "models": {
             "raw": "P_raw = P_cluster",
             "two_scale": "P_scale = S P_cluster S^T",
+            "diag_whitened": (
+                "P_diag=P^{1/2} diag(diag(C)) P^{1/2}"
+            ),
+            "block_whitened": (
+                "P_block=P^{1/2} blockdiag(C_tt,C_rr) P^{1/2}"
+            ),
             "full_whitened": (
                 "z=P^{-1/2}e; C=E[zz^T]; "
                 "P_full=P^{1/2} C P^{1/2}"
@@ -673,18 +768,21 @@ def main():
                 scales["s_r"],
             ],
         },
-        "full_whitened_calibration": {
-            "C": tensor_to_list(full["C"]),
+        "whitened_calibration": {
             "C_empirical": tensor_to_list(full["C_empirical"]),
             "mean_z": tensor_to_list(full["mean_z"]),
-            "eigenvalues": tensor_to_list(full["eigenvalues"]),
-            "condition": full["condition"],
             "shrinkage": full["shrinkage"],
-            "trace": full["trace"],
-            "cross_frobenius": full["cross_frobenius"],
-            "diag_t": tensor_to_list(full["diag_t"]),
-            "diag_r": tensor_to_list(full["diag_r"]),
             "eig_floor_rel": args.eig_floor_rel,
+            "variants": {
+                mode: {
+                    "C": tensor_to_list(info["C"]),
+                    "eigenvalues": tensor_to_list(info["eigenvalues"]),
+                    "condition": info["condition"],
+                    "trace": info["trace"],
+                    "cross_frobenius": info["cross_frobenius"],
+                }
+                for mode, info in structured.items()
+            },
         },
         "train_sequences": {
             name: str(path) for name, path in train_specs
