@@ -213,6 +213,15 @@ def load_sequence(name, directory, block_size):
                 "maha": float(data["maha_median"]),
                 "condition": float(data["condition"]),
                 "num_pixels": int(data["num_pixels"]),
+                "cluster_count": int(
+                    data.get("cluster_counts", {}).get(
+                        block_size,
+                        data.get("cluster_counts", {}).get(
+                            str(block_size),
+                            data.get("cluster_count", 0),
+                        ),
+                    )
+                ),
             }
         )
 
@@ -567,6 +576,288 @@ def evaluate_split(sequence_samples, scales, structured, eig_floor_rel):
     return result
 
 
+ADAPTIVE_FEATURE_NAMES = [
+    "log_fb",
+    "log_maha",
+    "log_condition",
+    "log_num_pixels",
+    "log_cluster_count",
+    "log_sigma_t_raw",
+    "log_sigma_r_raw",
+]
+
+
+def _safe_log(value, eps=1e-12):
+    return math.log(max(float(value), eps))
+
+
+def adaptive_features(sample):
+    """Observable per-frame cues available online without ground truth."""
+    P = sample["P"]
+    sigma_t = covariance_sigma(P, slice(0, 3))
+    sigma_r = covariance_sigma(P, slice(3, 6))
+    cluster_count = max(int(sample.get("cluster_count", 0)), 1)
+    return torch.tensor(
+        [
+            _safe_log(sample["fb"]),
+            _safe_log(sample["maha"]),
+            _safe_log(sample["condition"]),
+            _safe_log(sample["num_pixels"]),
+            _safe_log(cluster_count),
+            _safe_log(sigma_t),
+            _safe_log(sigma_r),
+        ],
+        dtype=torch.float64,
+    )
+
+
+def _adaptive_base_nees(sample, structured, eig_floor_rel):
+    P_base = calibrated_covariance(
+        sample,
+        mode="diag",
+        structured=structured,
+        eig_floor_rel=eig_floor_rel,
+    )
+    return stable_nees(sample["error"], P_base)
+
+
+def fit_adaptive_scale(
+    samples,
+    structured,
+    eig_floor_rel=1e-10,
+    ridge=1.0,
+    huber_delta=1.5,
+    irls_iters=12,
+    log_target_clip=4.0,
+    gamma_min=0.1,
+    gamma_max=100.0,
+):
+    """Fit an interpretable frame-adaptive scalar on top of Diag-6.
+
+    The GT-only training target is the scalar required to make each frame's
+    6-DoF NEES equal its expected value:
+
+        gamma*_k = NEES_diag,k / 6.
+
+    At inference gamma is predicted only from observable cues. A robust
+    log-linear model is used:
+
+        log gamma_hat = beta_0 + beta^T standardized_features.
+
+    A final training-set scalar normalization preserves mean NEES=6 after the
+    relative frame-to-frame modulation has been learned.
+    """
+    if not samples:
+        raise ValueError("No samples for adaptive calibration")
+
+    X = torch.stack([adaptive_features(s) for s in samples], dim=0)
+    base_nees = torch.tensor(
+        [
+            _adaptive_base_nees(s, structured, eig_floor_rel)
+            for s in samples
+        ],
+        dtype=torch.float64,
+    )
+    y = torch.log((base_nees / 6.0).clamp_min(1e-12))
+    y = y.clamp(-float(log_target_clip), float(log_target_clip))
+
+    mean = X.mean(dim=0)
+    std = X.std(dim=0, unbiased=False).clamp_min(1e-6)
+    Xz = (X - mean) / std
+    Xd = torch.cat(
+        [torch.ones((Xz.shape[0], 1), dtype=Xz.dtype), Xz],
+        dim=1,
+    )
+
+    beta = torch.zeros(Xd.shape[1], dtype=torch.float64)
+    weights = torch.ones(Xd.shape[0], dtype=torch.float64)
+    penalty = torch.eye(Xd.shape[1], dtype=torch.float64)
+    penalty[0, 0] = 0.0
+
+    for _ in range(max(int(irls_iters), 1)):
+        WX = Xd * weights[:, None]
+        A = Xd.T @ WX + float(ridge) * penalty
+        b = Xd.T @ (weights * y)
+        try:
+            beta_new = torch.linalg.solve(A, b)
+        except RuntimeError:
+            beta_new = torch.linalg.pinv(A) @ b
+
+        residual = y - Xd @ beta_new
+        abs_r = residual.abs().clamp_min(1e-12)
+        weights_new = torch.where(
+            abs_r <= float(huber_delta),
+            torch.ones_like(abs_r),
+            float(huber_delta) / abs_r,
+        )
+
+        if torch.norm(beta_new - beta) < 1e-8:
+            beta = beta_new
+            weights = weights_new
+            break
+        beta = beta_new
+        weights = weights_new
+
+    log_pred = Xd @ beta
+    gamma_rel = torch.exp(log_pred).clamp(
+        min=float(gamma_min), max=float(gamma_max)
+    )
+
+    # Preserve train mean NEES=6 after adaptive modulation.
+    normalization = float((base_nees / gamma_rel).mean() / 6.0)
+    gamma = (normalization * gamma_rel).clamp(
+        min=float(gamma_min), max=float(gamma_max)
+    )
+    # One final normalization after clipping.
+    normalization2 = float((base_nees / gamma).mean() / 6.0)
+    gamma = (normalization2 * gamma).clamp(
+        min=float(gamma_min), max=float(gamma_max)
+    )
+    total_normalization = normalization * normalization2
+
+    raw_coef = beta[1:] / std
+    raw_intercept = float(
+        beta[0] - torch.sum(beta[1:] * mean / std)
+        + math.log(max(total_normalization, 1e-12))
+    )
+
+    target_log = torch.log((base_nees / 6.0).clamp_min(1e-12))
+    pred_log = torch.log(gamma.clamp_min(1e-12))
+
+    return {
+        "feature_names": list(ADAPTIVE_FEATURE_NAMES),
+        "feature_mean": mean,
+        "feature_std": std,
+        "beta_standardized": beta,
+        "raw_intercept": raw_intercept,
+        "raw_coefficients": raw_coef,
+        "normalization": total_normalization,
+        "ridge": float(ridge),
+        "huber_delta": float(huber_delta),
+        "irls_iters": int(irls_iters),
+        "log_target_clip": float(log_target_clip),
+        "gamma_min": float(gamma_min),
+        "gamma_max": float(gamma_max),
+        "train_target_pred_pearson": pearson(
+            target_log.tolist(), pred_log.tolist()
+        ),
+        "train_target_pred_spearman": spearman(
+            target_log.tolist(), pred_log.tolist()
+        ),
+        "train_gamma_mean": float(gamma.mean()),
+        "train_gamma_median": float(gamma.median()),
+        "train_gamma_min": float(gamma.min()),
+        "train_gamma_max": float(gamma.max()),
+    }
+
+
+def predict_adaptive_gamma(sample, model):
+    x = adaptive_features(sample)
+    coef = model["raw_coefficients"]
+    log_gamma = model["raw_intercept"] + float(coef @ x)
+    gamma = math.exp(max(min(log_gamma, 50.0), -50.0))
+    return min(max(gamma, model["gamma_min"]), model["gamma_max"])
+
+
+def summarize_adaptive(samples, structured, model, eig_floor_rel=1e-10):
+    nees6 = []
+    nees_t = []
+    nees_r = []
+    sig_t = []
+    sig_r = []
+    err_t = []
+    err_r = []
+    gammas = []
+    oracle_gamma = []
+
+    for sample in samples:
+        P_base = calibrated_covariance(
+            sample,
+            mode="diag",
+            structured=structured,
+            eig_floor_rel=eig_floor_rel,
+        )
+        gamma = predict_adaptive_gamma(sample, model)
+        P = gamma * P_base
+        err = sample["error"]
+
+        n6 = stable_nees(err, P)
+        nees6.append(n6)
+        nees_t.append(stable_nees(err[:3], P[:3, :3]))
+        nees_r.append(stable_nees(err[3:], P[3:, 3:]))
+
+        sig_t.append(covariance_sigma(P, slice(0, 3)))
+        sig_r.append(covariance_sigma(P, slice(3, 6)))
+        err_t.append(float(err[:3].norm()))
+        err_r.append(float(err[3:].norm()))
+        gammas.append(gamma)
+        oracle_gamma.append(
+            _adaptive_base_nees(sample, structured, eig_floor_rel) / 6.0
+        )
+
+    n6 = torch.tensor(nees6, dtype=torch.float64)
+    nt = torch.tensor(nees_t, dtype=torch.float64)
+    nr = torch.tensor(nees_r, dtype=torch.float64)
+    g = torch.tensor(gammas, dtype=torch.float64)
+
+    result = {
+        "count": len(samples),
+        "mean_nees_6d": float(n6.mean()),
+        "median_nees_6d": float(n6.median()),
+        "mean_nees_t": float(nt.mean()),
+        "mean_nees_r": float(nr.mean()),
+        "coverage_6d_95": float((n6 <= CHI2_6_95).double().mean()),
+        "coverage_6d_99": float((n6 <= CHI2_6_99).double().mean()),
+        "coverage_t_95": float((nt <= CHI2_3_95).double().mean()),
+        "coverage_t_99": float((nt <= CHI2_3_99).double().mean()),
+        "coverage_r_95": float((nr <= CHI2_3_95).double().mean()),
+        "coverage_r_99": float((nr <= CHI2_3_99).double().mean()),
+        "pearson_t": pearson(sig_t, err_t),
+        "spearman_t": spearman(sig_t, err_t),
+        "pearson_r": pearson(sig_r, err_r),
+        "spearman_r": spearman(sig_r, err_r),
+        "median_sigma_t": float(torch.tensor(sig_t).median()),
+        "median_sigma_r": float(torch.tensor(sig_r).median()),
+        "median_error_t": float(torch.tensor(err_t).median()),
+        "median_error_r": float(torch.tensor(err_r).median()),
+        "gamma_mean": float(g.mean()),
+        "gamma_median": float(g.median()),
+        "gamma_min": float(g.min()),
+        "gamma_max": float(g.max()),
+        "gamma_oracle_pearson": pearson(gammas, oracle_gamma),
+        "gamma_oracle_spearman": spearman(gammas, oracle_gamma),
+    }
+    return result
+
+
+def serialize_adaptive_model(model):
+    return {
+        "feature_names": model["feature_names"],
+        "feature_mean": tensor_to_list(model["feature_mean"]),
+        "feature_std": tensor_to_list(model["feature_std"]),
+        "beta_standardized": tensor_to_list(model["beta_standardized"]),
+        "raw_intercept": model["raw_intercept"],
+        "raw_coefficients": tensor_to_list(model["raw_coefficients"]),
+        "normalization": model["normalization"],
+        "ridge": model["ridge"],
+        "huber_delta": model["huber_delta"],
+        "irls_iters": model["irls_iters"],
+        "log_target_clip": model["log_target_clip"],
+        "gamma_min": model["gamma_min"],
+        "gamma_max": model["gamma_max"],
+        "train_target_pred_pearson": model[
+            "train_target_pred_pearson"
+        ],
+        "train_target_pred_spearman": model[
+            "train_target_pred_spearman"
+        ],
+        "train_gamma_mean": model["train_gamma_mean"],
+        "train_gamma_median": model["train_gamma_median"],
+        "train_gamma_min": model["train_gamma_min"],
+        "train_gamma_max": model["train_gamma_max"],
+    }
+
+
 def tensor_to_list(x):
     return x.detach().cpu().tolist()
 
@@ -622,6 +913,7 @@ def print_loso_fold(held_out, train_names, test_metrics):
     for mode, label in [
         ("scale", "two-scale"),
         ("diag", "diag-6"),
+        ("adaptive", "diag-6 + adaptive"),
         ("block", "block-6"),
         ("full", "full-6x6"),
     ]:
@@ -629,10 +921,19 @@ def print_loso_fold(held_out, train_names, test_metrics):
             f"LOSO TEST {held_out} {label}",
             test_metrics[mode],
         )
+        if mode == "adaptive":
+            m = test_metrics[mode]
+            print(
+                "  gamma: "
+                f"mean={m['gamma_mean']:.4g}, "
+                f"median={m['gamma_median']:.4g}, "
+                f"range=[{m['gamma_min']:.4g}, {m['gamma_max']:.4g}], "
+                f"oracle Spearman={m['gamma_oracle_spearman']:.4f}"
+            )
 
 
 def aggregate_loso_metrics(folds):
-    modes = ["scale", "diag", "block", "full"]
+    modes = ["scale", "diag", "adaptive", "block", "full"]
     fields = [
         "mean_nees_6d",
         "median_nees_6d",
@@ -674,6 +975,7 @@ def print_loso_aggregate(aggregate):
     for mode, label in [
         ("scale", "two-scale"),
         ("diag", "diag-6"),
+        ("adaptive", "adaptive"),
         ("block", "block-6"),
         ("full", "full-6x6"),
     ]:
@@ -731,6 +1033,29 @@ def run_loso(args, specs):
             shrinkage=args.full_shrinkage,
             eig_floor_rel=args.eig_floor_rel,
         )
+        adaptive = fit_adaptive_scale(
+            train_samples,
+            structured,
+            eig_floor_rel=args.eig_floor_rel,
+            ridge=args.adaptive_ridge,
+            huber_delta=args.adaptive_huber_delta,
+            irls_iters=args.adaptive_irls_iters,
+            log_target_clip=args.adaptive_log_target_clip,
+            gamma_min=args.adaptive_gamma_min,
+            gamma_max=args.adaptive_gamma_max,
+        )
+
+        print("\nAdaptive model coefficients for held-out " + held_out + ":")
+        print(f"  intercept={adaptive['raw_intercept']:.6g}")
+        for name, coef in zip(
+            adaptive["feature_names"],
+            adaptive["raw_coefficients"],
+        ):
+            print(f"  {name:20s}: {float(coef): .6g}")
+        print(
+            "  train target/pred Spearman="
+            f"{adaptive['train_target_pred_spearman']:.4f}"
+        )
 
         test_metrics = {
             "raw": summarize(test_samples, mode="raw"),
@@ -741,6 +1066,12 @@ def run_loso(args, specs):
                 test_samples,
                 mode="diag",
                 structured=structured,
+                eig_floor_rel=args.eig_floor_rel,
+            ),
+            "adaptive": summarize_adaptive(
+                test_samples,
+                structured,
+                adaptive,
                 eig_floor_rel=args.eig_floor_rel,
             ),
             "block": summarize(
@@ -771,7 +1102,16 @@ def run_loso(args, specs):
             "calibration": serialize_calibration(
                 scales, full, structured, args.eig_floor_rel
             ),
-            "train_pooled_metrics": train_metrics,
+            "adaptive_model": serialize_adaptive_model(adaptive),
+            "train_pooled_metrics": {
+                **train_metrics,
+                "adaptive": summarize_adaptive(
+                    train_samples,
+                    structured,
+                    adaptive,
+                    eig_floor_rel=args.eig_floor_rel,
+                ),
+            },
             "test_metrics": test_metrics,
         }
 
@@ -785,6 +1125,15 @@ def run_loso(args, specs):
         "block_size": args.block_size,
         "full_shrinkage": args.full_shrinkage,
         "eig_floor_rel": args.eig_floor_rel,
+        "adaptive_settings": {
+            "ridge": args.adaptive_ridge,
+            "huber_delta": args.adaptive_huber_delta,
+            "irls_iters": args.adaptive_irls_iters,
+            "log_target_clip": args.adaptive_log_target_clip,
+            "gamma_min": args.adaptive_gamma_min,
+            "gamma_max": args.adaptive_gamma_max,
+            "features": list(ADAPTIVE_FEATURE_NAMES),
+        },
         "sequence_paths": paths,
         "covariance_sources": sources,
         "folds": folds,
@@ -842,6 +1191,42 @@ def main():
         type=float,
         default=1e-10,
         help="Relative eigenvalue floor used for stable matrix roots.",
+    )
+    parser.add_argument(
+        "--adaptive-ridge",
+        type=float,
+        default=1.0,
+        help="Ridge penalty for the adaptive log-scale model.",
+    )
+    parser.add_argument(
+        "--adaptive-huber-delta",
+        type=float,
+        default=1.5,
+        help="Huber threshold used by robust adaptive-scale IRLS.",
+    )
+    parser.add_argument(
+        "--adaptive-irls-iters",
+        type=int,
+        default=12,
+        help="Maximum IRLS iterations for adaptive-scale regression.",
+    )
+    parser.add_argument(
+        "--adaptive-log-target-clip",
+        type=float,
+        default=4.0,
+        help="Clip log(NEES/6) training targets to +/- this value.",
+    )
+    parser.add_argument(
+        "--adaptive-gamma-min",
+        type=float,
+        default=0.1,
+        help="Minimum frame-adaptive covariance scale.",
+    )
+    parser.add_argument(
+        "--adaptive-gamma-max",
+        type=float,
+        default=100.0,
+        help="Maximum frame-adaptive covariance scale.",
     )
     parser.add_argument(
         "--output",
