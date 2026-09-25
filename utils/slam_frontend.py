@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from utils.pose_utils import SE3_exp, scale_se3_step, SO3_exp, so3_log
 from utils.m2_uncertainty import (
     apply_whitened_diag_calibration,
+    load_diag6_calibration_report,
     propagate_right_pose_covariance,
     relative_parameter_cov_to_right,
 )
@@ -256,6 +257,69 @@ class FrontEnd(mp.Process):
         self.m2a_diag_calibration = unc_cfg.get(
             "m2a_diag_calibration", None
         )
+        self.m2a_diag_calibration_file = unc_cfg.get(
+            "m2a_diag_calibration_file", None
+        )
+        self.m2a_diag_calibration_fold = unc_cfg.get(
+            "m2a_diag_calibration_fold", None
+        )
+        self.m2a_diag_calibration_source = None
+        self.m2a_diag_calibration_train_sequences = []
+
+        if self.m2a_use_diag_calibration:
+            if self.m2a_diag_calibration is not None:
+                values = torch.as_tensor(
+                    self.m2a_diag_calibration, dtype=torch.float64
+                ).reshape(-1)
+                if values.numel() != 6:
+                    raise ValueError(
+                        "Uncertainty.m2a_diag_calibration must contain "
+                        "exactly 6 positive values."
+                    )
+                if (
+                    not bool(torch.isfinite(values).all())
+                    or bool((values <= 0).any())
+                ):
+                    raise ValueError(
+                        "Uncertainty.m2a_diag_calibration must be finite "
+                        "and strictly positive."
+                    )
+                self.m2a_diag_calibration = values.tolist()
+                self.m2a_diag_calibration_source = "inline-config"
+            elif self.m2a_diag_calibration_file:
+                calib_info = load_diag6_calibration_report(
+                    self.m2a_diag_calibration_file,
+                    fold=self.m2a_diag_calibration_fold,
+                )
+                report_block = int(calib_info["block_size"])
+                if (
+                    report_block > 0
+                    and report_block != self.m1_cluster_block_size
+                ):
+                    raise ValueError(
+                        "M2-A1 calibration block-size mismatch: report uses "
+                        f"{report_block}, but M1 cluster_block_size is "
+                        f"{self.m1_cluster_block_size}."
+                    )
+                self.m2a_diag_calibration = calib_info["diag"]
+                self.m2a_diag_calibration_source = calib_info["source"]
+                self.m2a_diag_calibration_train_sequences = calib_info[
+                    "train_sequences"
+                ]
+                Log(
+                    "M2-A1 loaded Diag-6 calibration",
+                    self.m2a_diag_calibration,
+                    "source", self.m2a_diag_calibration_source,
+                    "train", self.m2a_diag_calibration_train_sequences,
+                    tag="Frontend",
+                )
+            else:
+                raise ValueError(
+                    "m2a_use_diag_calibration=true requires either "
+                    "m2a_diag_calibration=[c1,...,c6] or "
+                    "m2a_diag_calibration_file=<M1 calibration JSON>."
+                )
+
         self.m2a_right_jacobian_eps = float(
             unc_cfg.get("m2a_right_jacobian_eps", 1.0e-5)
         )
@@ -1005,6 +1069,20 @@ class FrontEnd(mp.Process):
                                 self.m2a_use_diag_calibration
                                 and self.m2a_diag_calibration is not None
                             ),
+                            "diag_calibration_values": (
+                                list(self.m2a_diag_calibration)
+                                if (
+                                    self.m2a_use_diag_calibration
+                                    and self.m2a_diag_calibration is not None
+                                )
+                                else None
+                            ),
+                            "diag_calibration_source": (
+                                self.m2a_diag_calibration_source
+                            ),
+                            "diag_calibration_train_sequences": list(
+                                self.m2a_diag_calibration_train_sequences
+                            ),
                         },
                         os.path.join(
                             m2_dir, f"{int(viewpoint.uid):06d}.pt"
@@ -1014,6 +1092,7 @@ class FrontEnd(mp.Process):
                 Log(
                     "M2-A frame", viewpoint.uid,
                     "source", viewpoint.pose_cov_source,
+                    "calib_source", self.m2a_diag_calibration_source,
                     "sigma_t_abs", sigma_t_abs.detach().cpu().tolist(),
                     "sigma_r_abs", sigma_r_abs.detach().cpu().tolist(),
                     "eig_min", float(eig_abs.min().detach().cpu()),
