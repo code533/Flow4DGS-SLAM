@@ -108,8 +108,15 @@ def nees(err, P):
 
 
 def summarize_cov(rows, label, pkey):
-    valid = [r for r in rows if pkey in r]
+    # Per-covariance values are stored with expanded keys such as
+    # "hess_sig_t", "cluster_sig_t", and "main_sig_t". Checking for the
+    # bare prefix (e.g. "hess") incorrectly filters every row out.
+    sig_key = pkey + "_sig_t"
+    nees_key = pkey + "_nees"
+    valid = [r for r in rows if sig_key in r and nees_key in r]
     if not valid:
+        print(f"\n=== {label} covariance ===")
+        print("no valid covariance diagnostics found")
         return
 
     sig_t = [r[pkey + "_sig_t"] for r in valid]
