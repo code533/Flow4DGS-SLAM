@@ -180,3 +180,60 @@ python scripts/analyze_m2a_pose_uncertainty.py \
 The analysis reports numerical PSD/symmetry checks, absolute-pose NEES and
 coverage against GT, uncertainty-error correlation, and the magnitude of the
 post-prior tracking correction.
+
+
+## M2-A1 frozen Diag-6 calibration
+
+M2-A1 separates two effects that were mixed in the first absolute-pose audit:
+
+1. recursive propagation of the raw M1 32x32 cluster covariance;
+2. recursive propagation after the frozen cross-sequence Diag-6 calibration
+   selected during M1.
+
+The preferred configuration is to load the calibration directly from an M1
+calibration report rather than copying six numbers by hand:
+
+```yaml
+Uncertainty:
+  enable_m1: true
+  enable_m2a: true
+
+  m2a_use_diag_calibration: true
+  m2a_diag_calibration: null
+  m2a_diag_calibration_file: results/m1_calibration_block32_structured.json
+  m2a_diag_calibration_fold: null
+```
+
+For an explicit train/test calibration JSON, `m2a_diag_calibration_fold`
+remains null.
+
+For a LOSO report, the held-out fold must be named explicitly:
+
+```yaml
+  m2a_diag_calibration_file: results/m1_loso_block32.json
+  m2a_diag_calibration_fold: walking_static
+```
+
+The loader then uses only the calibration stored in that fold, which was fitted
+from the other sequences. This prevents silently calibrating a test sequence
+with its own ground truth.
+
+At runtime M2-A1 performs
+
+```
+P_xi,raw
+  -> P_xi,diag = P_xi,raw^(1/2) C_d P_xi,raw^(1/2)
+  -> P_rel,right
+  -> recursive P_abs,right
+```
+
+while retaining the raw recursive covariance in parallel. Diagnostics record
+the six frozen Diag-6 values, report source, and calibration training sequence
+names so the provenance is auditable.
+
+The selected and raw absolute covariances can be compared with:
+
+```bash
+python scripts/analyze_m2a_pose_uncertainty.py \
+  results/m2a_pose_uncertainty
+```
