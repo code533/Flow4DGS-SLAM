@@ -237,3 +237,118 @@ The selected and raw absolute covariances can be compared with:
 python scripts/analyze_m2a_pose_uncertainty.py \
   results/m2a_pose_uncertainty
 ```
+
+
+## M2-A2 tracking posterior covariance
+
+M2-A2 treats the final static RGB-D tracking result as a pose observation and
+fuses its uncertainty with the M2-A1 motion prior.
+
+### Tracking residual model
+
+At the final tracked pose, M2-A2 freezes the baseline static masks and residual
+normalization. It forms signed residual maps from:
+
+- three RGB channels, including the baseline opacity multiplier and exposure;
+- one depth channel;
+- the same static/dynamic masking logic used by tracking.
+
+RGB and depth residuals are normalized by robust MAD scales measured at the
+final pose. The relative RGB/depth contribution follows the baseline tracking
+alpha.
+
+### Pose Jacobian
+
+The Flow4DGS rasterizer applies camera deltas as left perturbations:
+
+```
+T' = Exp([rho, theta]) T.
+```
+
+M2-A2 therefore estimates a left-tangent residual Jacobian by central finite
+differences around the final tracked pose. The default step is 1e-4 for both
+translation and rotation. Six dimensions require twelve additional static
+renders per audited frame.
+
+### Cluster-robust tracking covariance
+
+Let r_p be the normalized residual vector at pixel p and J_p its 4x6 Jacobian.
+M2-A2 first forms a robust bread matrix
+
+```
+A = sum_p J_p^T W_p J_p
+```
+
+and per-pixel scores
+
+```
+s_p = J_p^T W_p r_p.
+```
+
+Scores are summed inside 32x32 image blocks:
+
+```
+S_b = sum_{p in b} s_p.
+```
+
+The tracking pose-observation covariance is
+
+```
+P_track,left = A^-1 (sum_b S_b S_b^T) A^-1.
+```
+
+It is converted to the M2 right-invariant tangent using
+
+```
+P_track,right =
+  Ad_(T^-1) P_track,left Ad_(T^-1)^T.
+```
+
+### Prior/posterior fusion
+
+The calibrated M2-A1 motion prior is fused in information form:
+
+```
+P_post =
+  (P_prior^-1 + lambda_track P_track^-1)^-1.
+```
+
+The default lambda_track is 1.0. This parameter is exposed only for audit and
+must not be tuned on the evaluation sequence.
+
+When M2-A2 is enabled, the posterior replaces Camera.pose_cov_abs_right and is
+therefore the covariance propagated into the next frame. The pre-update prior,
+tracking observation covariance, and posterior are all saved for analysis.
+
+Configuration:
+
+```yaml
+Uncertainty:
+  enable_m1: true
+  enable_m2a: true
+  enable_m2a2: true
+
+  m2a2_cluster_block_size: 32
+  m2a2_translation_eps: 1.0e-4
+  m2a2_rotation_eps: 1.0e-4
+  m2a2_cauchy_c: 2.0
+  m2a2_damping: 1.0e-6
+  m2a2_information_scale: 1.0
+  m2a2_rgb_scale_floor: 0.01
+  m2a2_depth_scale_floor: 0.01
+```
+
+Analyze:
+
+```bash
+python scripts/analyze_m2a_pose_uncertainty.py \
+  results/m2a_pose_uncertainty
+```
+
+The report now separates:
+
+- raw recursive covariance;
+- calibrated M2-A1 motion prior;
+- M2-A2 tracking observation covariance;
+- M2-A2 posterior covariance;
+- selected absolute covariance.
