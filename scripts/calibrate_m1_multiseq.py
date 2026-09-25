@@ -38,6 +38,16 @@ Example:
         --test bonn_placing=/path/run3/m1_pose_uncertainty \
                sitting_static=/path/run4/m1_pose_uncertainty \
         --output results/m1_calibration_block32.json
+
+Automatic leave-one-sequence-out (LOSO):
+
+    python scripts/calibrate_m1_multiseq.py \
+        --block-size 32 \
+        --loso walking_static=/path/run1/m1_pose_uncertainty \
+               sitting_rpy=/path/run2/m1_pose_uncertainty \
+               bonn_placing=/path/run3/m1_pose_uncertainty \
+               sitting_static=/path/run4/m1_pose_uncertainty \
+        --output results/m1_loso_block32.json
 """
 
 import argparse
@@ -561,21 +571,256 @@ def tensor_to_list(x):
     return x.detach().cpu().tolist()
 
 
+def fit_calibration_family(samples, shrinkage, eig_floor_rel):
+    scales = fit_scales(samples)
+    full = fit_full_whitened(
+        samples,
+        shrinkage=shrinkage,
+        eig_floor_rel=eig_floor_rel,
+    )
+    structured = derive_structured_whitened_calibrations(full)
+    return scales, full, structured
+
+
+def serialize_calibration(scales, full, structured, eig_floor_rel):
+    return {
+        "two_scale": {
+            **scales,
+            "S_diagonal": [
+                scales["s_t"],
+                scales["s_t"],
+                scales["s_t"],
+                scales["s_r"],
+                scales["s_r"],
+                scales["s_r"],
+            ],
+        },
+        "whitened": {
+            "C_empirical": tensor_to_list(full["C_empirical"]),
+            "mean_z": tensor_to_list(full["mean_z"]),
+            "shrinkage": full["shrinkage"],
+            "eig_floor_rel": eig_floor_rel,
+            "variants": {
+                mode: {
+                    "C": tensor_to_list(info["C"]),
+                    "eigenvalues": tensor_to_list(info["eigenvalues"]),
+                    "condition": info["condition"],
+                    "trace": info["trace"],
+                    "cross_frobenius": info["cross_frobenius"],
+                }
+                for mode, info in structured.items()
+            },
+        },
+    }
+
+
+def print_loso_fold(held_out, train_names, test_metrics):
+    print("\n" + "=" * 76)
+    print(f"LOSO fold: held out = {held_out}")
+    print("train = " + ", ".join(train_names))
+    print("=" * 76)
+    for mode, label in [
+        ("scale", "two-scale"),
+        ("diag", "diag-6"),
+        ("block", "block-6"),
+        ("full", "full-6x6"),
+    ]:
+        print_metrics(
+            f"LOSO TEST {held_out} {label}",
+            test_metrics[mode],
+        )
+
+
+def aggregate_loso_metrics(folds):
+    modes = ["scale", "diag", "block", "full"]
+    fields = [
+        "mean_nees_6d",
+        "median_nees_6d",
+        "coverage_6d_95",
+        "coverage_6d_99",
+        "mean_nees_t",
+        "mean_nees_r",
+        "pearson_t",
+        "spearman_t",
+        "pearson_r",
+        "spearman_r",
+    ]
+    aggregate = {}
+
+    for mode in modes:
+        aggregate[mode] = {}
+        for field in fields:
+            vals = torch.tensor(
+                [
+                    fold["test_metrics"][mode][field]
+                    for fold in folds.values()
+                ],
+                dtype=torch.float64,
+            )
+            aggregate[mode][field + "_macro_mean"] = float(vals.mean())
+            aggregate[mode][field + "_macro_std"] = float(
+                vals.std(unbiased=False)
+            )
+            aggregate[mode][field + "_min"] = float(vals.min())
+            aggregate[mode][field + "_max"] = float(vals.max())
+
+    return aggregate
+
+
+def print_loso_aggregate(aggregate):
+    print("\n" + "=" * 76)
+    print("LOSO aggregate summary (macro average across held-out sequences)")
+    print("=" * 76)
+    for mode, label in [
+        ("scale", "two-scale"),
+        ("diag", "diag-6"),
+        ("block", "block-6"),
+        ("full", "full-6x6"),
+    ]:
+        a = aggregate[mode]
+        print(
+            f"{label:10s} | "
+            f"NEES={a['mean_nees_6d_macro_mean']:.4g}"
+            f"±{a['mean_nees_6d_macro_std']:.3g} | "
+            f"95%={100*a['coverage_6d_95_macro_mean']:.2f}%"
+            f"±{100*a['coverage_6d_95_macro_std']:.2f} | "
+            f"rho_t={a['spearman_t_macro_mean']:.4f} | "
+            f"rho_r={a['spearman_r_macro_mean']:.4f}"
+        )
+
+
+def run_loso(args, specs):
+    if len(specs) < 3:
+        raise ValueError(
+            "LOSO calibration requires at least three sequences so each fold "
+            "has at least two calibration sequences."
+        )
+
+    names = [name for name, _ in specs]
+    if len(set(names)) != len(names):
+        raise ValueError("LOSO sequence names must be unique.")
+
+    sequences = {}
+    sources = {}
+    paths = {}
+    for name, directory in specs:
+        samples, source = load_sequence(name, directory, args.block_size)
+        sequences[name] = samples
+        sources[name] = source
+        paths[name] = str(directory)
+
+    folds = {}
+
+    print("=" * 76)
+    print("M1 automatic leave-one-sequence-out calibration")
+    print("=" * 76)
+    print(f"block size: {args.block_size}x{args.block_size}")
+    print("sequences: " + ", ".join(names))
+
+    for held_out in names:
+        train_names = [name for name in names if name != held_out]
+        train_samples = [
+            sample
+            for name in train_names
+            for sample in sequences[name]
+        ]
+        test_samples = sequences[held_out]
+
+        scales, full, structured = fit_calibration_family(
+            train_samples,
+            shrinkage=args.full_shrinkage,
+            eig_floor_rel=args.eig_floor_rel,
+        )
+
+        test_metrics = {
+            "raw": summarize(test_samples, mode="raw"),
+            "scale": summarize(
+                test_samples, mode="scale", scales=scales
+            ),
+            "diag": summarize(
+                test_samples,
+                mode="diag",
+                structured=structured,
+                eig_floor_rel=args.eig_floor_rel,
+            ),
+            "block": summarize(
+                test_samples,
+                mode="block",
+                structured=structured,
+                eig_floor_rel=args.eig_floor_rel,
+            ),
+            "full": summarize(
+                test_samples,
+                mode="full",
+                structured=structured,
+                eig_floor_rel=args.eig_floor_rel,
+            ),
+        }
+
+        train_metrics = evaluate_split(
+            {name: sequences[name] for name in train_names},
+            scales,
+            structured,
+            args.eig_floor_rel,
+        )["pooled"]
+
+        folds[held_out] = {
+            "held_out": held_out,
+            "train_sequences": train_names,
+            "test_count": len(test_samples),
+            "calibration": serialize_calibration(
+                scales, full, structured, args.eig_floor_rel
+            ),
+            "train_pooled_metrics": train_metrics,
+            "test_metrics": test_metrics,
+        }
+
+        print_loso_fold(held_out, train_names, test_metrics)
+
+    aggregate = aggregate_loso_metrics(folds)
+    print_loso_aggregate(aggregate)
+
+    output = {
+        "mode": "loso",
+        "block_size": args.block_size,
+        "full_shrinkage": args.full_shrinkage,
+        "eig_floor_rel": args.eig_floor_rel,
+        "sequence_paths": paths,
+        "covariance_sources": sources,
+        "folds": folds,
+        "aggregate": aggregate,
+    }
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(output, indent=2), encoding="utf-8")
+    print(f"\nSaved LOSO report: {args.output}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--train",
         nargs="+",
-        required=True,
+        default=[],
         metavar="NAME=PATH",
-        help="Calibration sequences.",
+        help="Calibration sequences for an explicit train/test split.",
     )
     parser.add_argument(
         "--test",
         nargs="*",
         default=[],
         metavar="NAME=PATH",
-        help="Held-out sequences.",
+        help="Held-out sequences for an explicit train/test split.",
+    )
+    parser.add_argument(
+        "--loso",
+        nargs="+",
+        default=[],
+        metavar="NAME=PATH",
+        help=(
+            "Run automatic leave-one-sequence-out calibration over all "
+            "provided sequences. Cannot be combined with --train/--test."
+        ),
     )
     parser.add_argument(
         "--block-size",
@@ -607,6 +852,21 @@ def main():
 
     train_specs = parse_sequence_specs(args.train)
     test_specs = parse_sequence_specs(args.test)
+    loso_specs = parse_sequence_specs(args.loso)
+
+    if loso_specs:
+        if train_specs or test_specs:
+            raise ValueError(
+                "--loso cannot be combined with --train or --test."
+            )
+        run_loso(args, loso_specs)
+        return
+
+    if not train_specs:
+        raise ValueError(
+            "Provide either --loso NAME=PATH ... or at least one --train "
+            "NAME=PATH sequence."
+        )
 
     overlap = set(n for n, _ in train_specs) & set(n for n, _ in test_specs)
     if overlap:
@@ -633,13 +893,11 @@ def main():
         s for samples in train_sequences.values() for s in samples
     ]
 
-    scales = fit_scales(train_pooled)
-    full = fit_full_whitened(
+    scales, full, structured = fit_calibration_family(
         train_pooled,
         shrinkage=args.full_shrinkage,
         eig_floor_rel=args.eig_floor_rel,
     )
-    structured = derive_structured_whitened_calibrations(full)
 
     print("=" * 76)
     print("M1 cross-sequence covariance calibration")
