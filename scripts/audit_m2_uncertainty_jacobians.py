@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 """Numerical audit for M2 uncertainty Jacobians."""
 
+import sys
+from pathlib import Path
+
+# When executed as `python scripts/<script>.py`, Python places the scripts
+# directory (not the repository root) on sys.path. Add the repository root so
+# imports such as `utils.m2_uncertainty` work from the documented command.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import torch
 
 from utils.m2_uncertainty import (
