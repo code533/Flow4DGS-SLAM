@@ -413,3 +413,44 @@ macro-averaged aggregate summary across folds.
 
 The LOSO result is intended as the final M1 model-selection audit before
 freezing the covariance structure for downstream uncertainty propagation.
+
+
+## Adaptive frame-level inflation
+
+After LOSO validation, Diag-6 remains the preferred cross-sequence covariance
+structure but still shows sequence-dependent calibration gaps. The calibration
+script therefore supports an additional frame-adaptive scalar:
+
+```
+P_adapt,k = gamma_k P_diag,k
+```
+
+The training-only target is:
+
+```
+gamma*_k = NEES_diag,k / 6
+```
+
+but the predicted `gamma_k` uses only runtime-observable cues:
+
+- log forward/backward flow error,
+- log Mahalanobis residual statistic,
+- log Hessian condition number,
+- log valid-pixel count,
+- log active-cluster count,
+- log raw translation uncertainty,
+- log raw rotation uncertainty.
+
+The predictor is a robust ridge-regularized log-linear model fitted with Huber
+IRLS. Its relative modulation is normalized so training mean NEES remains 6.
+
+Automatic LOSO now reports an additional model:
+
+```
+diag-6 + adaptive
+```
+
+together with per-fold gamma statistics and gamma-vs-oracle Spearman
+correlation. This is an offline audit only; the model should be integrated
+online only if held-out LOSO improves calibration without damaging uncertainty
+ranking.
