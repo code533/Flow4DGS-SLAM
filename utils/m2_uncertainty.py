@@ -178,6 +178,36 @@ def world_point_covariance(
     return X_w, Sigma
 
 
+def symmetric_psd_sqrt(P, eig_floor_rel=1e-12):
+    """Symmetric square root with a small relative eigenvalue floor."""
+    P = 0.5 * (P + P.T)
+    eig, vec = torch.linalg.eigh(P)
+    max_eig = eig.max().clamp_min(1e-18)
+    eig = eig.clamp_min(max_eig * float(eig_floor_rel))
+    root = (vec * torch.sqrt(eig).unsqueeze(0)) @ vec.T
+    return 0.5 * (root + root.T)
+
+
+def apply_whitened_diag_calibration(P, diag_calibration):
+    """Apply the frozen M1 Diag-6 calibration in whitened coordinates.
+
+    P_cal = P^(1/2) diag(c_1,...,c_6) P^(1/2).
+
+    diag_calibration contains the six diagonal entries of C_d, not their
+    square roots.
+    """
+    d = torch.as_tensor(
+        diag_calibration, device=P.device, dtype=P.dtype
+    )
+    if d.numel() != 6:
+        raise ValueError("diag_calibration must contain exactly 6 values")
+    d = d.reshape(6).clamp_min(0.0)
+    root = symmetric_psd_sqrt(P)
+    C = torch.diag(d)
+    P_cal = root @ C @ root
+    return 0.5 * (P_cal + P_cal.T)
+
+
 def covariance_rms_m(Sigma):
     tr = torch.diagonal(Sigma, dim1=-2, dim2=-1).sum(-1)
     return torch.sqrt(torch.clamp(tr / 3.0, min=0.0))
