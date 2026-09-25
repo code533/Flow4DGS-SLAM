@@ -135,6 +135,95 @@ def summarize(rows, key, label):
     )
 
 
+def summarize_tracking_update(rows):
+    valid = [
+        r for r in rows
+        if "err_prior" in r and "err_final" in r
+    ]
+    if not valid:
+        print("\n=== M2-A2 tracking prior/posterior audit ===")
+        print("no frames with T_motion_prior")
+        return
+
+    prior_t, final_t = [], []
+    prior_r, final_r = [], []
+    gain_t, gain_r = [], []
+    ratio_t, ratio_r = [], []
+
+    for r in valid:
+        ep = r["err_prior"]
+        ef = r["err_final"]
+
+        pt = float(torch.linalg.norm(ep[:3]))
+        ft = float(torch.linalg.norm(ef[:3]))
+        pr = float(torch.linalg.norm(ep[3:]))
+        fr = float(torch.linalg.norm(ef[3:]))
+
+        prior_t.append(pt)
+        final_t.append(ft)
+        prior_r.append(pr)
+        final_r.append(fr)
+
+        gain_t.append(pt - ft)
+        gain_r.append(pr - fr)
+        ratio_t.append(ft / max(pt, 1e-12))
+        ratio_r.append(fr / max(pr, 1e-12))
+
+    def stats(x):
+        t = torch.tensor(x, dtype=torch.float64)
+        return float(t.median()), float(t.mean()), float(t.max())
+
+    p_tm, p_tmean, _ = stats(prior_t)
+    f_tm, f_tmean, _ = stats(final_t)
+    p_rm, p_rmean, _ = stats(prior_r)
+    f_rm, f_rmean, _ = stats(final_r)
+    g_tm, g_tmean, _ = stats(gain_t)
+    g_rm, g_rmean, _ = stats(gain_r)
+    rt_med, rt_mean, _ = stats(ratio_t)
+    rr_med, rr_mean, _ = stats(ratio_r)
+
+    improved_t = sum(g > 0 for g in gain_t) / len(gain_t)
+    improved_r = sum(g > 0 for g in gain_r) / len(gain_r)
+
+    print("\n=== M2-A2 tracking prior/posterior audit ===")
+    print(f"frames: {len(valid)}")
+    print(
+        "translation error prior -> final: "
+        f"median {p_tm:.6g} -> {f_tm:.6g} m, "
+        f"mean {p_tmean:.6g} -> {f_tmean:.6g} m"
+    )
+    print(
+        "rotation error prior -> final: "
+        f"median {p_rm:.6g} -> {f_rm:.6g} rad, "
+        f"mean {p_rmean:.6g} -> {f_rmean:.6g} rad"
+    )
+    print(
+        "tracking error reduction: "
+        f"translation median={g_tm:.6g}, mean={g_tmean:.6g}, "
+        f"improved={100.0*improved_t:.2f}%"
+    )
+    print(
+        "tracking error reduction: "
+        f"rotation median={g_rm:.6g}, mean={g_rmean:.6g}, "
+        f"improved={100.0*improved_r:.2f}%"
+    )
+    print(
+        "final/prior error ratio: "
+        f"translation median={rt_med:.4f}, mean={rt_mean:.4f}; "
+        f"rotation median={rr_med:.4f}, mean={rr_mean:.4f}"
+    )
+    print(
+        "prior-vs-final error correlation: "
+        f"translation Pearson={pearson(prior_t, final_t):.4f}, "
+        f"Spearman={spearman(prior_t, final_t):.4f}"
+    )
+    print(
+        "prior-vs-final error correlation: "
+        f"rotation Pearson={pearson(prior_r, final_r):.4f}, "
+        f"Spearman={spearman(prior_r, final_r):.4f}"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("directory", type=Path)
@@ -159,9 +248,16 @@ def main():
         row = {
             "frame": int(d["frame"]),
             "err": err,
+            "err_final": err,
             "P_abs": d["P_abs_right"].double(),
             "P_abs_raw": d["P_abs_right_raw"].double(),
         }
+
+        if d.get("T_motion_prior", None) is not None:
+            T_prior = d["T_motion_prior"].double()
+            row["err_prior"] = SE3_log(
+                torch.linalg.inv(T_prior) @ T_gt
+            )
         rows.append(row)
 
         source = str(d.get("source", "unknown"))
@@ -180,6 +276,7 @@ def main():
 
     summarize(rows, "P_abs_raw", "raw recursively propagated covariance")
     summarize(rows, "P_abs", "selected recursively propagated covariance")
+    summarize_tracking_update(rows)
 
     if track_dt:
         x = torch.tensor(track_dt)
