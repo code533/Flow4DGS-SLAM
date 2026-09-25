@@ -250,3 +250,29 @@ With shadow mode enabled, M1 should not intentionally change the baseline
 pose mean or keyframe-selection inputs. Remaining keyframe differences should
 therefore be investigated as scheduling/non-determinism or another unrelated
 state mutation rather than as an uncertainty-estimator effect.
+
+
+## Multi-scale block-size ablation
+
+M1 now computes several cluster-robust covariance variants from the same final
+pixel-score field in a single SLAM run. By default:
+
+```yaml
+Uncertainty:
+  cluster_block_size: 32
+  cluster_block_sizes: [16, 32, 64]
+```
+
+`cluster_block_size` selects the covariance used as the main M1 output,
+while `cluster_block_sizes` controls the ablation set saved for analysis.
+
+Each diagnostic file now contains:
+
+- `P_xi_clusters[16]`
+- `P_xi_clusters[32]`
+- `P_xi_clusters[64]`
+- per-scale cluster counts
+
+The analysis script prints Pearson/Spearman correlation, NEES, coverage, and
+uncertainty quintiles for every requested block size. This avoids rerunning
+the complete SLAM pipeline only to change the cluster partition.
