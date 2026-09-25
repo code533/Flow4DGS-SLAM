@@ -126,3 +126,57 @@ Run:
 
 Only after this audit passes should M2 be wired into live Camera objects and
 dynamic Gaussian observations.
+
+
+## M2-A live shadow propagation
+
+M2-A is now wired into the frontend in shadow mode.
+
+Configuration:
+
+```yaml
+Uncertainty:
+  enable_m1: true
+  enable_m2a: true
+  m2a_save_diagnostics: true
+  m2a_use_diag_calibration: false
+  m2a_diag_calibration: null
+  m2a_right_jacobian_eps: 1.0e-5
+```
+
+At frame 0, the covariance is anchored to zero because the baseline explicitly
+initializes that frame with the ground-truth pose.
+
+For each subsequent frame:
+
+1. take the M1 32x32 cluster covariance in xi-parameter coordinates;
+2. optionally apply the externally frozen Diag-6 calibration in that same
+   parameter space;
+3. convert to a right-invariant relative group covariance;
+4. propagate the previous absolute covariance using the relative pose actually
+   applied after the Flow4DGS motion cap;
+5. attach both raw and selected absolute covariance to the Camera object;
+6. keep covariance unchanged through the later photometric tracking iterations
+   and log the deterministic pose correction magnitude.
+
+This last choice is intentionally an audit approximation. The photometric
+tracking stage adds information, so a future posterior update may reduce the
+pose covariance. M2-A first measures how large that correction is before
+introducing another information model.
+
+Diagnostics are written to:
+
+```
+<Results.save_dir>/m2a_pose_uncertainty/*.pt
+```
+
+Analyze them with:
+
+```bash
+python scripts/analyze_m2a_pose_uncertainty.py \
+  results/m2a_pose_uncertainty
+```
+
+The analysis reports numerical PSD/symmetry checks, absolute-pose NEES and
+coverage against GT, uncertainty-error correlation, and the magnitude of the
+post-prior tracking correction.
