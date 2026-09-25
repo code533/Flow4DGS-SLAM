@@ -390,3 +390,26 @@ This ablation isolates whether held-out improvements are explained by:
 
 No SLAM rerun is required. Re-run only
 `scripts/calibrate_m1_multiseq.py` on the existing M1 diagnostic folders.
+
+
+## Leave-one-sequence-out validation
+
+The calibration script supports automatic LOSO evaluation:
+
+```bash
+python scripts/calibrate_m1_multiseq.py \
+  --block-size 32 \
+  --loso walking_static=/path/run1/m1_pose_uncertainty \
+         sitting_rpy=/path/run2/m1_pose_uncertainty \
+         bonn_placing=/path/run3/m1_pose_uncertainty \
+         sitting_static=/path/run4/m1_pose_uncertainty \
+  --output results/m1_loso_block32.json
+```
+
+For each fold, one complete sequence is held out and all calibration
+parameters are fitted only on the remaining sequences. The script reports
+held-out metrics for two-scale, Diag-6, Block-6 and Full-6, then prints a
+macro-averaged aggregate summary across folds.
+
+The LOSO result is intended as the final M1 model-selection audit before
+freezing the covariance structure for downstream uncertainty propagation.
