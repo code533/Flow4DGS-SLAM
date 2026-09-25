@@ -276,3 +276,38 @@ Each diagnostic file now contains:
 The analysis script prints Pearson/Spearman correlation, NEES, coverage, and
 uncertainty quintiles for every requested block size. This avoids rerunning
 the complete SLAM pipeline only to change the cluster partition.
+
+
+## Cross-sequence calibration
+
+Use `scripts/calibrate_m1_multiseq.py` to fit a sequence-independent
+translation/rotation scale on calibration sequences and evaluate it on held-out
+sequences.
+
+The current calibration model is intentionally simple:
+
+```
+P_cal = S P_cluster S^T
+S = diag(s_t, s_t, s_t, s_r, s_r, s_r)
+```
+
+`s_t` and `s_r` are fitted only from the training split by matching the
+mean translation- and rotation-marginal NEES to their 3-DoF expected value.
+
+Example:
+
+```bash
+python scripts/calibrate_m1_multiseq.py \
+  --block-size 32 \
+  --train walking_xyz=/path/run1/m1_pose_uncertainty \
+          sitting_static=/path/run2/m1_pose_uncertainty \
+  --test bonn_placing=/path/run3/m1_pose_uncertainty \
+         sitting_rpy=/path/run4/m1_pose_uncertainty \
+  --output results/m1_calibration_block32.json
+```
+
+The report includes raw and calibrated pooled/per-sequence NEES, chi-square
+coverage, and Pearson/Spearman ranking metrics. If held-out NEES remains
+strongly sequence-dependent after this scale calibration, that is evidence for
+adding an explicit model-discrepancy term `Q_model` rather than further
+tuning the cluster block size.
