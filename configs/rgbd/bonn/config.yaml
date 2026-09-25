@@ -132,6 +132,7 @@ Uncertainty:
   save_diagnostics: true
   cluster_covariance: true
   cluster_block_size: 32
+  cluster_block_sizes: [16, 32, 64]
   cluster_small_sample_correction: true
   shadow_mode: true
   log_keyframe_reasons: true
