@@ -252,6 +252,12 @@ def main():
             "P_abs": d["P_abs_right"].double(),
             "P_abs_raw": d["P_abs_right_raw"].double(),
         }
+        if d.get("P_abs_prior_right", None) is not None:
+            row["P_prior"] = d["P_abs_prior_right"].double()
+        if d.get("P_abs_post_right", None) is not None:
+            row["P_post"] = d["P_abs_post_right"].double()
+        if d.get("P_track_right", None) is not None:
+            row["P_track"] = d["P_track_right"].double()
 
         if d.get("T_motion_prior", None) is not None:
             T_prior = d["T_motion_prior"].double()
@@ -275,7 +281,10 @@ def main():
     print("sources:", sources)
 
     summarize(rows, "P_abs_raw", "raw recursively propagated covariance")
-    summarize(rows, "P_abs", "selected recursively propagated covariance")
+    summarize(rows, "P_prior", "M2-A1 calibrated motion prior covariance")
+    summarize(rows, "P_track", "M2-A2 tracking observation covariance")
+    summarize(rows, "P_post", "M2-A2 posterior covariance")
+    summarize(rows, "P_abs", "selected absolute covariance")
     summarize_tracking_update(rows)
 
     if track_dt:
