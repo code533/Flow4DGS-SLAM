@@ -33,6 +33,13 @@ from utils.m2_uncertainty import (
     propagate_right_pose_covariance,
     relative_parameter_cov_to_right,
 )
+from utils.m2_tracking_uncertainty import (
+    build_tracking_residual_context,
+    cluster_robust_tracking_covariance,
+    fuse_prior_tracking_covariance,
+    left_covariance_to_right,
+    tracking_residual_tensor,
+)
 
 
 def flow_to_pixels(flow_norm, H, W, mode='grid'):
@@ -324,6 +331,44 @@ class FrontEnd(mp.Process):
             unc_cfg.get("m2a_right_jacobian_eps", 1.0e-5)
         )
 
+        # M2-A2: tracking-posterior covariance audit. This is intentionally
+        # disabled by default because finite-difference rendering adds twelve
+        # extra static renders per audited frame.
+        self.m2a2_enable = bool(unc_cfg.get("enable_m2a2", False))
+        self.m2a2_save_diagnostics = bool(
+            unc_cfg.get("m2a2_save_diagnostics", True)
+        )
+        self.m2a2_block_size = int(
+            unc_cfg.get("m2a2_cluster_block_size", 32)
+        )
+        self.m2a2_trans_eps = float(
+            unc_cfg.get("m2a2_translation_eps", 1.0e-4)
+        )
+        self.m2a2_rot_eps = float(
+            unc_cfg.get("m2a2_rotation_eps", 1.0e-4)
+        )
+        self.m2a2_cauchy_c = float(
+            unc_cfg.get("m2a2_cauchy_c", 2.0)
+        )
+        self.m2a2_damping = float(
+            unc_cfg.get("m2a2_damping", 1.0e-6)
+        )
+        self.m2a2_information_scale = float(
+            unc_cfg.get("m2a2_information_scale", 1.0)
+        )
+        self.m2a2_rgb_scale_floor = float(
+            unc_cfg.get("m2a2_rgb_scale_floor", 0.01)
+        )
+        self.m2a2_depth_scale_floor = float(
+            unc_cfg.get("m2a2_depth_scale_floor", 0.01)
+        )
+
+        if self.m2a2_enable and not self.m2a_enable:
+            raise ValueError(
+                "enable_m2a2=true requires enable_m2a=true because the "
+                "tracking posterior needs an M2-A motion prior."
+            )
+
         if self.m2a_enable and not self.m1_uncertainty:
             Log(
                 "M2-A requested while M1 is disabled; M2-A propagation will "
@@ -445,6 +490,10 @@ class FrontEnd(mp.Process):
         m2a_rel_right = None
         m2a_abs_raw = None
         m2a_abs_cal = None
+        m2a2_track_left = None
+        m2a2_track_right = None
+        m2a2_post_right = None
+        m2a2_stats = None
         
         opt_params = []
         opt_params.append(
@@ -968,6 +1017,149 @@ class FrontEnd(mp.Process):
 
         self.median_depth = get_median_depth(depth, opacity)
 
+        # M2-A2: estimate a cluster-robust tracking pose covariance around
+        # the FINAL tracked pose and fuse it with the M2-A motion prior.
+        if (
+            self.m2a2_enable
+            and self.m2a_enable
+            and viewpoint.pose_cov_valid
+            and m2a_prior_pose is not None
+        ):
+            with torch.no_grad():
+                # The tracking loop optimizes only static Gaussians.
+                static_mask = (self.gaussians.dygs == False)
+                final_static_pkg = render(
+                    viewpoint,
+                    self.gaussians,
+                    self.pipeline_params,
+                    self.background,
+                    dynamic=False,
+                    dx=dxyz,
+                    ds=d_scale,
+                    dr=d_rot,
+                    mask=static_mask,
+                )
+                track_context = build_tracking_residual_context(
+                    self.config,
+                    final_static_pkg,
+                    viewpoint,
+                    rm_dynamic=True,
+                    extra_mask=None,
+                    rgb_scale_floor=self.m2a2_rgb_scale_floor,
+                    depth_scale_floor=self.m2a2_depth_scale_floor,
+                )
+                residual0, valid0 = tracking_residual_tensor(
+                    final_static_pkg, viewpoint, track_context
+                )
+
+                C, H, W = residual0.shape
+                J_track = torch.empty(
+                    (C, H, W, 6),
+                    device=residual0.device,
+                    dtype=residual0.dtype,
+                )
+
+                # Flow4DGS rasterizer deltas are LEFT pose perturbations:
+                # T' = Exp([rho,theta]) T. Central finite differences isolate
+                # the local tracking residual Jacobian without changing the
+                # baseline final pose mean.
+                eps = [
+                    self.m2a2_trans_eps,
+                    self.m2a2_trans_eps,
+                    self.m2a2_trans_eps,
+                    self.m2a2_rot_eps,
+                    self.m2a2_rot_eps,
+                    self.m2a2_rot_eps,
+                ]
+                for j in range(6):
+                    viewpoint.cam_trans_delta.data.zero_()
+                    viewpoint.cam_rot_delta.data.zero_()
+                    if j < 3:
+                        viewpoint.cam_trans_delta.data[j] = eps[j]
+                    else:
+                        viewpoint.cam_rot_delta.data[j - 3] = eps[j]
+
+                    pkg_p = render(
+                        viewpoint,
+                        self.gaussians,
+                        self.pipeline_params,
+                        self.background,
+                        dynamic=False,
+                        dx=dxyz,
+                        ds=d_scale,
+                        dr=d_rot,
+                        mask=static_mask,
+                    )
+                    r_p, _ = tracking_residual_tensor(
+                        pkg_p, viewpoint, track_context
+                    )
+
+                    viewpoint.cam_trans_delta.data.zero_()
+                    viewpoint.cam_rot_delta.data.zero_()
+                    if j < 3:
+                        viewpoint.cam_trans_delta.data[j] = -eps[j]
+                    else:
+                        viewpoint.cam_rot_delta.data[j - 3] = -eps[j]
+
+                    pkg_m = render(
+                        viewpoint,
+                        self.gaussians,
+                        self.pipeline_params,
+                        self.background,
+                        dynamic=False,
+                        dx=dxyz,
+                        ds=d_scale,
+                        dr=d_rot,
+                        mask=static_mask,
+                    )
+                    r_m, _ = tracking_residual_tensor(
+                        pkg_m, viewpoint, track_context
+                    )
+
+                    J_track[..., j] = (r_p - r_m) / (2.0 * eps[j])
+
+                viewpoint.cam_trans_delta.data.zero_()
+                viewpoint.cam_rot_delta.data.zero_()
+
+                m2a2_stats = cluster_robust_tracking_covariance(
+                    residual0,
+                    J_track,
+                    valid0,
+                    block_size=self.m2a2_block_size,
+                    cauchy_c=self.m2a2_cauchy_c,
+                    damping=self.m2a2_damping,
+                    small_sample_correction=True,
+                )
+                m2a2_track_left = m2a2_stats["cov"]
+
+                T_final_m2a2 = torch.eye(
+                    4,
+                    device=viewpoint.R.device,
+                    dtype=viewpoint.R.dtype,
+                )
+                T_final_m2a2[:3, :3] = viewpoint.R
+                T_final_m2a2[:3, 3] = viewpoint.T
+
+                m2a2_track_right = left_covariance_to_right(
+                    T_final_m2a2,
+                    m2a2_track_left,
+                )
+                m2a2_post_right = fuse_prior_tracking_covariance(
+                    viewpoint.pose_cov_abs_right,
+                    m2a2_track_right,
+                    information_scale=self.m2a2_information_scale,
+                )
+
+                # From this point onward, Camera.pose_cov_abs_right is the
+                # posterior covariance used by the next frame's recursion.
+                # The pre-update prior remains in local variables/diagnostics.
+                viewpoint.pose_cov_abs_right = (
+                    m2a2_post_right.detach().clone()
+                )
+                viewpoint.pose_cov_source = (
+                    viewpoint.pose_cov_source + "+trackCR"
+                )
+
         if self.m2a_enable and viewpoint.pose_cov_valid:
             with torch.no_grad():
                 T_final = torch.eye(
@@ -1000,6 +1192,11 @@ class FrontEnd(mp.Process):
 
                 P_abs = viewpoint.pose_cov_abs_right
                 P_raw = viewpoint.pose_cov_abs_right_raw
+                P_prior_selected = (
+                    m2a_abs_cal
+                    if m2a_abs_cal is not None
+                    else P_abs
+                )
                 eig_abs = torch.linalg.eigvalsh(
                     0.5 * (P_abs + P_abs.T)
                 )
@@ -1021,7 +1218,25 @@ class FrontEnd(mp.Process):
                             "frame": int(viewpoint.uid),
                             "source": viewpoint.pose_cov_source,
                             "P_abs_right": P_abs.detach().cpu(),
+                            "P_abs_prior_right": (
+                                P_prior_selected.detach().cpu()
+                            ),
                             "P_abs_right_raw": P_raw.detach().cpu(),
+                            "P_track_left": (
+                                m2a2_track_left.detach().cpu()
+                                if m2a2_track_left is not None
+                                else None
+                            ),
+                            "P_track_right": (
+                                m2a2_track_right.detach().cpu()
+                                if m2a2_track_right is not None
+                                else None
+                            ),
+                            "P_abs_post_right": (
+                                m2a2_post_right.detach().cpu()
+                                if m2a2_post_right is not None
+                                else None
+                            ),
                             "P_rel_right": (
                                 viewpoint.pose_cov_rel_right.detach().cpu()
                                 if viewpoint.pose_cov_rel_right is not None
@@ -1083,6 +1298,43 @@ class FrontEnd(mp.Process):
                             "diag_calibration_train_sequences": list(
                                 self.m2a_diag_calibration_train_sequences
                             ),
+                            "m2a2_enabled": bool(self.m2a2_enable),
+                            "m2a2_block_size": int(self.m2a2_block_size),
+                            "m2a2_information_scale": float(
+                                self.m2a2_information_scale
+                            ),
+                            "m2a2_cluster_count": (
+                                int(m2a2_stats["cluster_count"])
+                                if m2a2_stats is not None
+                                else 0
+                            ),
+                            "m2a2_num_pixels": (
+                                int(m2a2_stats["num_pixels"])
+                                if m2a2_stats is not None
+                                else 0
+                            ),
+                            "m2a2_num_observations": (
+                                int(m2a2_stats["num_observations"])
+                                if m2a2_stats is not None
+                                else 0
+                            ),
+                            "m2a2_condition": (
+                                m2a2_stats["condition"].detach().cpu()
+                                if m2a2_stats is not None
+                                else None
+                            ),
+                            "m2a2_rgb_scale": (
+                                track_context["rgb_scale"].detach().cpu()
+                                if self.m2a2_enable
+                                and m2a2_stats is not None
+                                else None
+                            ),
+                            "m2a2_depth_scale": (
+                                track_context["depth_scale"].detach().cpu()
+                                if self.m2a2_enable
+                                and m2a2_stats is not None
+                                else None
+                            ),
                         },
                         os.path.join(
                             m2_dir, f"{int(viewpoint.uid):06d}.pt"
@@ -1098,6 +1350,14 @@ class FrontEnd(mp.Process):
                     "eig_min", float(eig_abs.min().detach().cpu()),
                     "track_dt", float(corr_t.detach().cpu()),
                     "track_dr", float(corr_r.detach().cpu()),
+                    "m2a2_clusters", (
+                        int(m2a2_stats["cluster_count"])
+                        if m2a2_stats is not None else 0
+                    ),
+                    "m2a2_obs", (
+                        int(m2a2_stats["num_observations"])
+                        if m2a2_stats is not None else 0
+                    ),
                     tag="Frontend",
                 )
 
