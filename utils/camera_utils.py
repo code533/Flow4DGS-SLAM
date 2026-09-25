@@ -52,6 +52,19 @@ class Camera(nn.Module):
         self.R_gt = gt_T[:3, :3]
         self.T_gt = gt_T[:3, 3]
 
+        # M2-A shadow-state uncertainty. These tensors never participate in
+        # baseline tracking/mapping decisions; they are populated by the
+        # frontend only when M2-A is enabled.
+        self.pose_cov_abs_right = torch.zeros(
+            (6, 6), device=device, dtype=T.dtype
+        )
+        self.pose_cov_abs_right_raw = torch.zeros(
+            (6, 6), device=device, dtype=T.dtype
+        )
+        self.pose_cov_rel_right = None
+        self.pose_cov_valid = False
+        self.pose_cov_source = None
+
         self.original_image = color
         self.depth = depth
         self.depth_mask = np.isfinite(depth) & (depth > 0.0)
