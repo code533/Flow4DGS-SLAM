@@ -227,6 +227,9 @@ class FrontEnd(mp.Process):
         self.m1_save_diagnostics = bool(unc_cfg.get("save_diagnostics", True))
         self.m1_cluster_covariance = bool(unc_cfg.get("cluster_covariance", True))
         self.m1_cluster_block_size = int(unc_cfg.get("cluster_block_size", 32))
+        self.m1_cluster_block_sizes = [
+            int(v) for v in unc_cfg.get("cluster_block_sizes", [16, 32, 64])
+        ]
         self.m1_cluster_small_sample = bool(
             unc_cfg.get("cluster_small_sample_correction", True)
         )
@@ -502,6 +505,7 @@ class FrontEnd(mp.Process):
                         min_pixels=self.m1_min_pixels,
                         cluster_covariance=self.m1_cluster_covariance,
                         cluster_block_size=self.m1_cluster_block_size,
+                        cluster_block_sizes=self.m1_cluster_block_sizes,
                         cluster_small_sample_correction=self.m1_cluster_small_sample,
                         fixed_xi=xi_baseline if self.m1_shadow_mode else None,
                     )
@@ -628,9 +632,20 @@ class FrontEnd(mp.Process):
                             "P_xi_raw": P_xi.detach().cpu(),
                             "P_xi_hessian": P_hessian.detach().cpu(),
                             "P_xi_cluster": P_cluster.detach().cpu(),
+                            "P_xi_clusters": {
+                                int(bs): P.detach().cpu()
+                                for bs, P in m1_result["cov_clusters"].items()
+                            },
                             "covariance_mode": m1_result["covariance_mode"],
                             "cluster_count": int(m1_result["cluster_count"]),
+                            "cluster_counts": {
+                                int(bs): int(n)
+                                for bs, n in m1_result["cluster_counts"].items()
+                            },
                             "cluster_block_size": int(m1_result["cluster_block_size"]),
+                            "cluster_block_sizes": [
+                                int(bs) for bs in m1_result["cluster_block_sizes"]
+                            ],
                             "T_rel_raw": T_rel.detach().cpu(),
                             "T_rel_applied": T_rel_applied.detach().cpu(),
                             "T_rel_gt": T_rel_gt.detach().cpu(),
@@ -660,6 +675,9 @@ class FrontEnd(mp.Process):
                         "shadow", bool(self.m1_shadow_mode),
                         "clusters", int(m1_result["cluster_count"]),
                         "block", int(m1_result["cluster_block_size"]),
+                        "blocks_all", [
+                            int(bs) for bs in m1_result["cluster_block_sizes"]
+                        ],
                         "N", int(m1_result["num_pixels"]),
                         tag="Frontend",
                     )
