@@ -180,6 +180,8 @@ def main():
             "hess": d.get("P_xi_hessian", Pmain).double(),
             "cluster": d.get("P_xi_cluster", Pmain).double(),
         }
+        for bs, P in d.get("P_xi_clusters", {}).items():
+            Ps[f"cluster{int(bs)}"] = P.double()
 
         eig = torch.linalg.eigvalsh(0.5 * (Pmain + Pmain.T))
         bad["finite"] += int(not bool(torch.isfinite(Pmain).all()))
@@ -195,6 +197,7 @@ def main():
             "mode": d.get("covariance_mode", "legacy"),
             "clusters": int(d.get("cluster_count", 0)),
             "block": int(d.get("cluster_block_size", 0)),
+            "block_sizes": [int(v) for v in d.get("cluster_block_sizes", [])],
         }
 
         if "T_rel_gt" in d:
@@ -261,7 +264,23 @@ def main():
     )
 
     summarize_cov(gt, "naive Hessian", "hess")
-    summarize_cov(gt, "cluster-robust", "cluster")
+
+    multiscale_keys = sorted({
+        key.split("_sig_t")[0]
+        for r in gt
+        for key in r.keys()
+        if key.startswith("cluster") and key.endswith("_sig_t")
+        and key not in {"cluster_sig_t"}
+    }, key=lambda k: int(k.replace("cluster", "")))
+
+    if multiscale_keys:
+        print("\n=== Multi-scale cluster block ablation ===")
+        for key in multiscale_keys:
+            bs = int(key.replace("cluster", ""))
+            summarize_cov(gt, f"cluster-robust {bs}x{bs}", key)
+    else:
+        summarize_cov(gt, "cluster-robust", "cluster")
+
     summarize_cov(gt, "selected/main", "main")
 
 
