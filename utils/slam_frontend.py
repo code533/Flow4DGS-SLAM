@@ -621,10 +621,30 @@ class FrontEnd(mp.Process):
                     # M1 returns covariance of the exponential-coordinate
                     # parameter xi. Convert it to right-invariant relative
                     # group-error covariance before recursive propagation.
-                    P_rel_param = m1_result["cov_cluster"]
+                    P_rel_param_raw = m1_result["cov_cluster"]
+
+                    # M1 Diag-6 was fitted in the xi-parameter covariance
+                    # space, so calibration must be applied before converting
+                    # to a right-invariant group-error covariance.
+                    if (
+                        self.m2a_use_diag_calibration
+                        and self.m2a_diag_calibration is not None
+                    ):
+                        P_rel_param_cal = apply_whitened_diag_calibration(
+                            P_rel_param_raw,
+                            self.m2a_diag_calibration,
+                        )
+                    else:
+                        P_rel_param_cal = P_rel_param_raw
+
+                    m2a_rel_right_raw = relative_parameter_cov_to_right(
+                        xi,
+                        P_rel_param_raw,
+                        eps=self.m2a_right_jacobian_eps,
+                    )
                     m2a_rel_right = relative_parameter_cov_to_right(
                         xi,
-                        P_rel_param,
+                        P_rel_param_cal,
                         eps=self.m2a_right_jacobian_eps,
                     )
 
@@ -635,37 +655,33 @@ class FrontEnd(mp.Process):
                         device=T_rel.device, dtype=T_rel.dtype
                     )
 
+                    # The baseline applies a deterministic motion cap after
+                    # the raw flow estimate. Use the actually applied relative
+                    # mean for adjoint transport, while retaining the M1
+                    # covariance as the process-noise approximation. The cap
+                    # correction is logged for later audit.
+                    T_rel_applied_m2a = torch.linalg.inv(T_prev) @ T_curr
+
                     if prev.pose_cov_valid:
                         m2a_abs_raw = propagate_right_pose_covariance(
                             P_prev_raw,
-                            T_rel,
-                            m2a_rel_right,
+                            T_rel_applied_m2a,
+                            m2a_rel_right_raw,
                         )
                     else:
                         # If a previous frame has no valid propagated state,
                         # restart the shadow chain from the current relative
                         # motion rather than injecting fabricated certainty.
-                        m2a_abs_raw = m2a_rel_right.clone()
-
-                    if (
-                        self.m2a_use_diag_calibration
-                        and self.m2a_diag_calibration is not None
-                    ):
-                        P_rel_for_abs = apply_whitened_diag_calibration(
-                            m2a_rel_right,
-                            self.m2a_diag_calibration,
-                        )
-                    else:
-                        P_rel_for_abs = m2a_rel_right
+                        m2a_abs_raw = m2a_rel_right_raw.clone()
 
                     if prev.pose_cov_valid:
                         m2a_abs_cal = propagate_right_pose_covariance(
                             P_prev_abs,
-                            T_rel,
-                            P_rel_for_abs,
+                            T_rel_applied_m2a,
+                            m2a_rel_right,
                         )
                     else:
-                        m2a_abs_cal = P_rel_for_abs.clone()
+                        m2a_abs_cal = m2a_rel_right.clone()
 
                     viewpoint.pose_cov_rel_right = (
                         m2a_rel_right.detach().clone()
@@ -948,6 +964,29 @@ class FrontEnd(mp.Process):
                                 else None
                             ),
                             "T_final": T_final.detach().cpu(),
+                            "T_gt": torch.cat(
+                                [
+                                    torch.cat(
+                                        [
+                                            viewpoint.R_gt.to(
+                                                device=T_final.device,
+                                                dtype=T_final.dtype,
+                                            ),
+                                            viewpoint.T_gt.to(
+                                                device=T_final.device,
+                                                dtype=T_final.dtype,
+                                            ).reshape(3, 1),
+                                        ],
+                                        dim=1,
+                                    ),
+                                    torch.tensor(
+                                        [[0.0, 0.0, 0.0, 1.0]],
+                                        device=T_final.device,
+                                        dtype=T_final.dtype,
+                                    ),
+                                ],
+                                dim=0,
+                            ).detach().cpu(),
                             "T_motion_prior": (
                                 m2a_prior_pose.detach().cpu()
                                 if m2a_prior_pose is not None
