@@ -358,3 +358,35 @@ Optional regularization:
 shrinks `C` toward an isotropic matrix with the same trace. The default is
 zero shrinkage so that the first experiment directly tests whether covariance
 shape/cross-correlation calibration explains the remaining NEES gap.
+
+
+## Structured whitened calibration ablation
+
+The calibration script now compares three structured variants derived from the
+same training-set whitened second-moment matrix `C`:
+
+```
+Diag-6:
+  C_diag = diag(diag(C))
+
+Block-6:
+  C_block = blockdiag(C_tt, C_rr)
+
+Full-6:
+  C_full = C
+```
+
+The corresponding calibrated covariance is always
+
+```
+P_cal = P_cluster^(1/2) C_* P_cluster^(1/2).
+```
+
+This ablation isolates whether held-out improvements are explained by:
+
+1. per-DoF anisotropic scale only,
+2. within-translation / within-rotation coupling,
+3. translation-rotation cross coupling.
+
+No SLAM rerun is required. Re-run only
+`scripts/calibrate_m1_multiseq.py` on the existing M1 diagnostic folders.
