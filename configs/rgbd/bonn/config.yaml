@@ -136,3 +136,12 @@ Uncertainty:
   cluster_small_sample_correction: true
   shadow_mode: true
   log_keyframe_reasons: true
+
+  # M2-A absolute pose covariance propagation. Shadow-only by default.
+  enable_m2a: false
+  m2a_save_diagnostics: true
+  m2a_use_diag_calibration: false
+  # Fill with six frozen Diag-6 entries from an external calibration split
+  # before enabling calibrated M2-A propagation.
+  m2a_diag_calibration: null
+  m2a_right_jacobian_eps: 1.0e-5
