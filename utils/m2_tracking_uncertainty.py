@@ -165,6 +165,62 @@ def tracking_residual_tensor(render_pkg, viewpoint, context):
     return residual, valid
 
 
+def tracking_jacobian_diagnostics(
+    residual,
+    jacobian,
+    valid,
+    cauchy_c=2.0,
+    damping=1e-6,
+):
+    """Numerical sensitivity diagnostics for a tracking residual Jacobian.
+
+    Returns per-DoF RMS Jacobian magnitude on valid observations plus the
+    robust bread-matrix eigenspectrum/condition number. These quantities are
+    useful for determining whether a finite-difference step is below the
+    rasterizer's effective numerical resolution.
+    """
+    if residual.ndim != 3 or jacobian.ndim != 4:
+        raise ValueError("Unexpected tracking residual/Jacobian shape")
+    C, H, W = residual.shape
+    if jacobian.shape != (C, H, W, 6):
+        raise ValueError("jacobian must have shape [C,H,W,6]")
+
+    r = residual.permute(1, 2, 0).reshape(-1, C)
+    J = jacobian.permute(1, 2, 0, 3).reshape(-1, C, 6)
+    m = valid.permute(1, 2, 0).reshape(-1, C)
+
+    mf = m.to(dtype=J.dtype)
+    denom = mf.sum().clamp_min(1.0)
+    j_rms = torch.sqrt(
+        ((J * J) * mf[..., None]).sum(dim=(0, 1)) / denom
+    )
+
+    c2 = float(cauchy_c) ** 2
+    w = (1.0 / (1.0 + (r * r) / c2)) * mf
+    A = torch.einsum("nci,nc,ncj->ij", J, w, J)
+    mean_diag = torch.diagonal(A).mean().abs().clamp_min(1e-12)
+    Hmat = A + float(damping) * mean_diag * torch.eye(
+        6, device=A.device, dtype=A.dtype
+    )
+    eig = torch.linalg.eigvalsh(0.5 * (Hmat + Hmat.T))
+    positive = eig[eig > 0]
+    if positive.numel() > 0:
+        condition = eig.max() / positive.min().clamp_min(1e-18)
+    else:
+        condition = torch.tensor(
+            float("inf"), device=eig.device, dtype=eig.dtype
+        )
+
+    return {
+        "j_rms": j_rms,
+        "bread_eigenvalues": eig,
+        "bread_condition": condition,
+        "bread_trace": torch.trace(Hmat),
+        "valid_observations": int(m.sum()),
+        "valid_pixels": int(m.any(dim=1).sum()),
+    }
+
+
 def cluster_robust_tracking_covariance(
     residual,
     jacobian,
