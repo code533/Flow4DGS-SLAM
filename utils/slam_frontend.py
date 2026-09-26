@@ -38,6 +38,7 @@ from utils.m2_tracking_uncertainty import (
     cluster_robust_tracking_covariance,
     fuse_prior_tracking_covariance,
     left_covariance_to_right,
+    tracking_jacobian_diagnostics,
     tracking_residual_tensor,
 )
 
@@ -363,6 +364,30 @@ class FrontEnd(mp.Process):
             unc_cfg.get("m2a2_depth_scale_floor", 0.01)
         )
 
+        # Optional finite-difference sensitivity audit. When enabled, only
+        # selected frames are swept so we can diagnose rasterizer resolution
+        # without multiplying the full-sequence runtime excessively.
+        self.m2a2_fd_audit = bool(
+            unc_cfg.get("m2a2_fd_audit", False)
+        )
+        self.m2a2_fd_audit_frames = set(
+            int(v) for v in unc_cfg.get(
+                "m2a2_fd_audit_frames", [50, 200, 400, 600]
+            )
+        )
+        self.m2a2_fd_translation_scales = [
+            float(v) for v in unc_cfg.get(
+                "m2a2_fd_translation_scales",
+                [1.0e-4, 5.0e-4, 1.0e-3, 5.0e-3],
+            )
+        ]
+        self.m2a2_fd_rotation_scales = [
+            float(v) for v in unc_cfg.get(
+                "m2a2_fd_rotation_scales",
+                [1.0e-4, 5.0e-4, 1.0e-3, 5.0e-3],
+            )
+        ]
+
         if self.m2a2_enable and not self.m2a_enable:
             raise ValueError(
                 "enable_m2a2=true requires enable_m2a=true because the "
@@ -494,6 +519,7 @@ class FrontEnd(mp.Process):
         m2a2_track_right = None
         m2a2_post_right = None
         m2a2_stats = None
+        m2a2_fd_audit_payload = None
         
         opt_params = []
         opt_params.append(
@@ -1121,6 +1147,130 @@ class FrontEnd(mp.Process):
                 viewpoint.cam_trans_delta.data.zero_()
                 viewpoint.cam_rot_delta.data.zero_()
 
+                jac_diag = tracking_jacobian_diagnostics(
+                    residual0,
+                    J_track,
+                    valid0,
+                    cauchy_c=self.m2a2_cauchy_c,
+                    damping=self.m2a2_damping,
+                )
+
+                # Optional epsilon sweep on a sparse frame subset. Each scale
+                # evaluates all 6 DoF by central difference. The resulting
+                # Jacobian magnitudes and bread spectra reveal whether the
+                # nominal 1e-4 step sits below the rasterizer's useful
+                # numerical resolution.
+                if (
+                    self.m2a2_fd_audit
+                    and int(viewpoint.uid) in self.m2a2_fd_audit_frames
+                ):
+                    sweep = {}
+                    for family, values in [
+                        ("translation", self.m2a2_fd_translation_scales),
+                        ("rotation", self.m2a2_fd_rotation_scales),
+                    ]:
+                        family_rows = []
+                        for audit_eps in values:
+                            J_audit = torch.empty_like(J_track)
+                            diff_rms = torch.zeros(
+                                6,
+                                device=residual0.device,
+                                dtype=residual0.dtype,
+                            )
+                            for j in range(6):
+                                step = (
+                                    float(audit_eps)
+                                    if (
+                                        (family == "translation" and j < 3)
+                                        or (family == "rotation" and j >= 3)
+                                    )
+                                    else (
+                                        self.m2a2_trans_eps
+                                        if j < 3
+                                        else self.m2a2_rot_eps
+                                    )
+                                )
+
+                                viewpoint.cam_trans_delta.data.zero_()
+                                viewpoint.cam_rot_delta.data.zero_()
+                                if j < 3:
+                                    viewpoint.cam_trans_delta.data[j] = step
+                                else:
+                                    viewpoint.cam_rot_delta.data[j - 3] = step
+                                pkg_p = render(
+                                    viewpoint,
+                                    self.gaussians,
+                                    self.pipeline_params,
+                                    self.background,
+                                    dynamic=False,
+                                    dx=dxyz,
+                                    ds=d_scale,
+                                    dr=d_rot,
+                                    mask=static_mask,
+                                )
+                                r_p, _ = tracking_residual_tensor(
+                                    pkg_p, viewpoint, track_context
+                                )
+
+                                viewpoint.cam_trans_delta.data.zero_()
+                                viewpoint.cam_rot_delta.data.zero_()
+                                if j < 3:
+                                    viewpoint.cam_trans_delta.data[j] = -step
+                                else:
+                                    viewpoint.cam_rot_delta.data[j - 3] = -step
+                                pkg_m = render(
+                                    viewpoint,
+                                    self.gaussians,
+                                    self.pipeline_params,
+                                    self.background,
+                                    dynamic=False,
+                                    dx=dxyz,
+                                    ds=d_scale,
+                                    dr=d_rot,
+                                    mask=static_mask,
+                                )
+                                r_m, _ = tracking_residual_tensor(
+                                    pkg_m, viewpoint, track_context
+                                )
+
+                                dr_pm = r_p - r_m
+                                J_audit[..., j] = dr_pm / (2.0 * step)
+                                vm = valid0.to(dtype=dr_pm.dtype)
+                                denom = vm.sum().clamp_min(1.0)
+                                diff_rms[j] = torch.sqrt(
+                                    ((dr_pm * dr_pm) * vm).sum() / denom
+                                )
+
+                            viewpoint.cam_trans_delta.data.zero_()
+                            viewpoint.cam_rot_delta.data.zero_()
+                            diag_audit = tracking_jacobian_diagnostics(
+                                residual0,
+                                J_audit,
+                                valid0,
+                                cauchy_c=self.m2a2_cauchy_c,
+                                damping=self.m2a2_damping,
+                            )
+                            family_rows.append(
+                                {
+                                    "eps": float(audit_eps),
+                                    "j_rms": diag_audit[
+                                        "j_rms"
+                                    ].detach().cpu(),
+                                    "diff_rms": diff_rms.detach().cpu(),
+                                    "bread_eigenvalues": diag_audit[
+                                        "bread_eigenvalues"
+                                    ].detach().cpu(),
+                                    "bread_condition": diag_audit[
+                                        "bread_condition"
+                                    ].detach().cpu(),
+                                    "bread_trace": diag_audit[
+                                        "bread_trace"
+                                    ].detach().cpu(),
+                                }
+                            )
+                        sweep[family] = family_rows
+                    m2a2_fd_audit_payload = sweep
+
                 m2a2_stats = cluster_robust_tracking_covariance(
                     residual0,
                     J_track,
@@ -1323,6 +1473,31 @@ class FrontEnd(mp.Process):
                                 if m2a2_stats is not None
                                 else None
                             ),
+                            "m2a2_j_rms": (
+                                jac_diag["j_rms"].detach().cpu()
+                                if m2a2_stats is not None
+                                else None
+                            ),
+                            "m2a2_bread_eigenvalues": (
+                                jac_diag[
+                                    "bread_eigenvalues"
+                                ].detach().cpu()
+                                if m2a2_stats is not None
+                                else None
+                            ),
+                            "m2a2_bread_condition": (
+                                jac_diag[
+                                    "bread_condition"
+                                ].detach().cpu()
+                                if m2a2_stats is not None
+                                else None
+                            ),
+                            "m2a2_bread_trace": (
+                                jac_diag["bread_trace"].detach().cpu()
+                                if m2a2_stats is not None
+                                else None
+                            ),
+                            "m2a2_fd_audit": m2a2_fd_audit_payload,
                             "m2a2_rgb_scale": (
                                 track_context["rgb_scale"].detach().cpu()
                                 if self.m2a2_enable
@@ -1357,6 +1532,18 @@ class FrontEnd(mp.Process):
                     "m2a2_obs", (
                         int(m2a2_stats["num_observations"])
                         if m2a2_stats is not None else 0
+                    ),
+                    "m2a2_jrms", (
+                        jac_diag["j_rms"].detach().cpu().tolist()
+                        if m2a2_stats is not None else None
+                    ),
+                    "m2a2_bread_cond", (
+                        float(
+                            jac_diag[
+                                "bread_condition"
+                            ].detach().cpu()
+                        )
+                        if m2a2_stats is not None else float("nan")
                     ),
                     tag="Frontend",
                 )
