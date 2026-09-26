@@ -13,11 +13,78 @@ cluster-robust sandwich estimator. The resulting left-tangent covariance is
 then converted to the right-invariant tangent used by M2-A recursion.
 """
 
+import json
 import math
+from pathlib import Path
 
 import torch
 
 from utils.m2_uncertainty import adjoint_SE3
+
+
+def load_tracking_diag6_calibration_report(path, fold=None):
+    """Load frozen M2-A2 Diag-6 calibration from split/LOSO JSON."""
+    report_path = Path(path).expanduser()
+    data = json.loads(report_path.read_text(encoding="utf-8"))
+
+    if data.get("model") != "m2a2_tracking_covariance":
+        raise ValueError(
+            f"{report_path} is not an M2-A2 tracking calibration report"
+        )
+
+    if data.get("mode") == "loso":
+        if fold is None:
+            raise ValueError(
+                "LOSO M2-A2 calibration requires "
+                "m2a2_calibration_fold=<held-out sequence name>."
+            )
+        folds = data.get("folds", {})
+        if fold not in folds:
+            raise KeyError(
+                f"Fold {fold!r} not found. Available: {sorted(folds.keys())}"
+            )
+        node = folds[fold]["calibration"]["diag6"]
+        train_sequences = list(
+            folds[fold].get("train_sequences", [])
+        )
+        source = f"{report_path}:fold={fold}"
+    else:
+        node = data["calibration"]["diag6"]
+        train_sequences = list(
+            data.get("train_sequences", {}).keys()
+        )
+        source = str(report_path)
+
+    diag = torch.as_tensor(node["diag"], dtype=torch.float64).reshape(-1)
+    if diag.numel() != 6:
+        raise ValueError("Tracking Diag-6 calibration must contain 6 values")
+    if not bool(torch.isfinite(diag).all()) or bool((diag <= 0).any()):
+        raise ValueError("Tracking Diag-6 entries must be finite and positive")
+
+    return {
+        "diag": diag.tolist(),
+        "source": source,
+        "train_sequences": train_sequences,
+        "held_out": fold,
+    }
+
+
+def apply_tracking_diag6_calibration(P, diag_calibration, eig_floor_rel=1e-10):
+    """Apply frozen M2-A2 Diag-6 calibration in whitened coordinates."""
+    P = 0.5 * (P + P.T)
+    eig, vec = torch.linalg.eigh(P)
+    max_eig = eig.max().clamp_min(1e-18)
+    eig = eig.clamp_min(max_eig * float(eig_floor_rel))
+    root = (vec * torch.sqrt(eig).unsqueeze(0)) @ vec.T
+
+    d = torch.as_tensor(
+        diag_calibration, device=P.device, dtype=P.dtype
+    ).reshape(-1)
+    if d.numel() != 6:
+        raise ValueError("diag_calibration must contain 6 values")
+    C = torch.diag(d.clamp_min(0.0))
+    P_cal = root @ C @ root.T
+    return 0.5 * (P_cal + P_cal.T)
 
 
 def _mad_scale(values, floor):
