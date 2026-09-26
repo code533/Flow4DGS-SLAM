@@ -34,10 +34,12 @@ from utils.m2_uncertainty import (
     relative_parameter_cov_to_right,
 )
 from utils.m2_tracking_uncertainty import (
+    apply_tracking_diag6_calibration,
     build_tracking_residual_context,
     cluster_robust_tracking_covariance,
     fuse_prior_tracking_covariance,
     left_covariance_to_right,
+    load_tracking_diag6_calibration_report,
     tracking_jacobian_diagnostics,
     tracking_residual_tensor,
 )
@@ -357,6 +359,63 @@ class FrontEnd(mp.Process):
         self.m2a2_information_scale = float(
             unc_cfg.get("m2a2_information_scale", 1.0)
         )
+
+        # Optional frozen cross-sequence calibration for P_track,right.
+        self.m2a2_use_diag_calibration = bool(
+            unc_cfg.get("m2a2_use_diag_calibration", False)
+        )
+        self.m2a2_diag_calibration = unc_cfg.get(
+            "m2a2_diag_calibration", None
+        )
+        self.m2a2_diag_calibration_file = unc_cfg.get(
+            "m2a2_diag_calibration_file", None
+        )
+        self.m2a2_diag_calibration_fold = unc_cfg.get(
+            "m2a2_diag_calibration_fold", None
+        )
+        self.m2a2_diag_calibration_source = None
+        self.m2a2_diag_calibration_train_sequences = []
+
+        if self.m2a2_use_diag_calibration:
+            if self.m2a2_diag_calibration is not None:
+                vals = torch.as_tensor(
+                    self.m2a2_diag_calibration, dtype=torch.float64
+                ).reshape(-1)
+                if (
+                    vals.numel() != 6
+                    or not bool(torch.isfinite(vals).all())
+                    or bool((vals <= 0).any())
+                ):
+                    raise ValueError(
+                        "m2a2_diag_calibration must contain 6 finite "
+                        "positive values"
+                    )
+                self.m2a2_diag_calibration = vals.tolist()
+                self.m2a2_diag_calibration_source = "inline-config"
+            elif self.m2a2_diag_calibration_file:
+                info = load_tracking_diag6_calibration_report(
+                    self.m2a2_diag_calibration_file,
+                    fold=self.m2a2_diag_calibration_fold,
+                )
+                self.m2a2_diag_calibration = info["diag"]
+                self.m2a2_diag_calibration_source = info["source"]
+                self.m2a2_diag_calibration_train_sequences = info[
+                    "train_sequences"
+                ]
+                Log(
+                    "M2-A2 loaded tracking Diag-6 calibration",
+                    self.m2a2_diag_calibration,
+                    "source", self.m2a2_diag_calibration_source,
+                    "train", self.m2a2_diag_calibration_train_sequences,
+                    tag="Frontend",
+                )
+            else:
+                raise ValueError(
+                    "m2a2_use_diag_calibration=true requires either "
+                    "m2a2_diag_calibration=[...] or "
+                    "m2a2_diag_calibration_file=<JSON>."
+                )
+
         self.m2a2_rgb_scale_floor = float(
             unc_cfg.get("m2a2_rgb_scale_floor", 0.01)
         )
@@ -516,6 +575,7 @@ class FrontEnd(mp.Process):
         m2a_abs_raw = None
         m2a_abs_cal = None
         m2a2_track_left = None
+        m2a2_track_right_raw = None
         m2a2_track_right = None
         m2a2_post_right = None
         m2a2_stats = None
@@ -1316,10 +1376,21 @@ class FrontEnd(mp.Process):
                 T_final_m2a2[:3, :3] = viewpoint.R
                 T_final_m2a2[:3, 3] = viewpoint.T
 
-                m2a2_track_right = left_covariance_to_right(
+                m2a2_track_right_raw = left_covariance_to_right(
                     T_final_m2a2,
                     m2a2_track_left,
                 )
+                if (
+                    self.m2a2_use_diag_calibration
+                    and self.m2a2_diag_calibration is not None
+                ):
+                    m2a2_track_right = apply_tracking_diag6_calibration(
+                        m2a2_track_right_raw,
+                        self.m2a2_diag_calibration,
+                    )
+                else:
+                    m2a2_track_right = m2a2_track_right_raw
+
                 m2a2_post_right = fuse_prior_tracking_covariance(
                     viewpoint.pose_cov_abs_right,
                     m2a2_track_right,
@@ -1403,6 +1474,11 @@ class FrontEnd(mp.Process):
                                 if m2a2_track_left is not None
                                 else None
                             ),
+                            "P_track_right_raw": (
+                                m2a2_track_right_raw.detach().cpu()
+                                if m2a2_track_right_raw is not None
+                                else None
+                            ),
                             "P_track_right": (
                                 m2a2_track_right.detach().cpu()
                                 if m2a2_track_right is not None
@@ -1478,6 +1554,24 @@ class FrontEnd(mp.Process):
                             "m2a2_block_size": int(self.m2a2_block_size),
                             "m2a2_information_scale": float(
                                 self.m2a2_information_scale
+                            ),
+                            "m2a2_diag_calibration_enabled": bool(
+                                self.m2a2_use_diag_calibration
+                                and self.m2a2_diag_calibration is not None
+                            ),
+                            "m2a2_diag_calibration_values": (
+                                list(self.m2a2_diag_calibration)
+                                if (
+                                    self.m2a2_use_diag_calibration
+                                    and self.m2a2_diag_calibration is not None
+                                )
+                                else None
+                            ),
+                            "m2a2_diag_calibration_source": (
+                                self.m2a2_diag_calibration_source
+                            ),
+                            "m2a2_diag_calibration_train_sequences": list(
+                                self.m2a2_diag_calibration_train_sequences
                             ),
                             "m2a2_cluster_count": (
                                 int(m2a2_stats["cluster_count"])
