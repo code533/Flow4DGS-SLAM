@@ -160,6 +160,14 @@ Uncertainty:
   m2a2_cauchy_c: 2.0
   m2a2_damping: 1.0e-6
   m2a2_information_scale: 1.0
+
+  # Frozen cross-sequence calibration for tracking covariance.
+  # Keep disabled while collecting raw diagnostics for calibration.
+  m2a2_use_diag_calibration: false
+  m2a2_diag_calibration: null
+  m2a2_diag_calibration_file: null
+  m2a2_diag_calibration_fold: null
+
   m2a2_rgb_scale_floor: 0.01
   m2a2_depth_scale_floor: 0.01
 
