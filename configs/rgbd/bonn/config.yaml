@@ -162,3 +162,9 @@ Uncertainty:
   m2a2_information_scale: 1.0
   m2a2_rgb_scale_floor: 0.01
   m2a2_depth_scale_floor: 0.01
+
+  # Sparse finite-difference sensitivity audit.
+  m2a2_fd_audit: false
+  m2a2_fd_audit_frames: [50, 200, 400, 600]
+  m2a2_fd_translation_scales: [1.0e-4, 5.0e-4, 1.0e-3, 5.0e-3]
+  m2a2_fd_rotation_scales: [1.0e-4, 5.0e-4, 1.0e-3, 5.0e-3]
