@@ -1085,10 +1085,28 @@ class FrontEnd(mp.Process):
                     dtype=residual0.dtype,
                 )
 
-                # Flow4DGS rasterizer deltas are LEFT pose perturbations:
-                # T' = Exp([rho,theta]) T. Central finite differences isolate
-                # the local tracking residual Jacobian without changing the
-                # baseline final pose mean.
+                # IMPORTANT: cam_trans_delta/cam_rot_delta are used by
+                # the custom rasterizer as backward pose-gradient hooks; their
+                # values do not perturb the forward render. Finite differences
+                # must therefore perturb the actual camera pose mean.
+                #
+                # The baseline tracking update convention is left-multiplicative:
+                #     T' = Exp(delta) @ T.
+                # We use the same convention here and restore the exact final
+                # tracked pose after every render.
+                viewpoint.cam_trans_delta.data.zero_()
+                viewpoint.cam_rot_delta.data.zero_()
+
+                R_fd_base = viewpoint.R.detach().clone()
+                t_fd_base = viewpoint.T.detach().clone()
+                T_fd_base = torch.eye(
+                    4,
+                    device=R_fd_base.device,
+                    dtype=R_fd_base.dtype,
+                )
+                T_fd_base[:3, :3] = R_fd_base
+                T_fd_base[:3, 3] = t_fd_base
+
                 eps = [
                     self.m2a2_trans_eps,
                     self.m2a2_trans_eps,
@@ -1098,12 +1116,14 @@ class FrontEnd(mp.Process):
                     self.m2a2_rot_eps,
                 ]
                 for j in range(6):
-                    viewpoint.cam_trans_delta.data.zero_()
-                    viewpoint.cam_rot_delta.data.zero_()
-                    if j < 3:
-                        viewpoint.cam_trans_delta.data[j] = eps[j]
-                    else:
-                        viewpoint.cam_rot_delta.data[j - 3] = eps[j]
+                    delta = torch.zeros(
+                        6,
+                        device=T_fd_base.device,
+                        dtype=T_fd_base.dtype,
+                    )
+                    delta[j] = float(eps[j])
+                    T_p = SE3_exp(delta) @ T_fd_base
+                    viewpoint.update_RT(T_p[:3, :3], T_p[:3, 3])
 
                     pkg_p = render(
                         viewpoint,
@@ -1120,12 +1140,9 @@ class FrontEnd(mp.Process):
                         pkg_p, viewpoint, track_context
                     )
 
-                    viewpoint.cam_trans_delta.data.zero_()
-                    viewpoint.cam_rot_delta.data.zero_()
-                    if j < 3:
-                        viewpoint.cam_trans_delta.data[j] = -eps[j]
-                    else:
-                        viewpoint.cam_rot_delta.data[j - 3] = -eps[j]
+                    delta[j] = -float(eps[j])
+                    T_m = SE3_exp(delta) @ T_fd_base
+                    viewpoint.update_RT(T_m[:3, :3], T_m[:3, 3])
 
                     pkg_m = render(
                         viewpoint,
@@ -1143,9 +1160,9 @@ class FrontEnd(mp.Process):
                     )
 
                     J_track[..., j] = (r_p - r_m) / (2.0 * eps[j])
+                    viewpoint.update_RT(R_fd_base, t_fd_base)
 
-                viewpoint.cam_trans_delta.data.zero_()
-                viewpoint.cam_rot_delta.data.zero_()
+                viewpoint.update_RT(R_fd_base, t_fd_base)
 
                 jac_diag = tracking_jacobian_diagnostics(
                     residual0,
@@ -1191,12 +1208,16 @@ class FrontEnd(mp.Process):
                                     )
                                 )
 
-                                viewpoint.cam_trans_delta.data.zero_()
-                                viewpoint.cam_rot_delta.data.zero_()
-                                if j < 3:
-                                    viewpoint.cam_trans_delta.data[j] = step
-                                else:
-                                    viewpoint.cam_rot_delta.data[j - 3] = step
+                                delta = torch.zeros(
+                                    6,
+                                    device=T_fd_base.device,
+                                    dtype=T_fd_base.dtype,
+                                )
+                                delta[j] = float(step)
+                                T_p = SE3_exp(delta) @ T_fd_base
+                                viewpoint.update_RT(
+                                    T_p[:3, :3], T_p[:3, 3]
+                                )
                                 pkg_p = render(
                                     viewpoint,
                                     self.gaussians,
@@ -1212,12 +1233,11 @@ class FrontEnd(mp.Process):
                                     pkg_p, viewpoint, track_context
                                 )
 
-                                viewpoint.cam_trans_delta.data.zero_()
-                                viewpoint.cam_rot_delta.data.zero_()
-                                if j < 3:
-                                    viewpoint.cam_trans_delta.data[j] = -step
-                                else:
-                                    viewpoint.cam_rot_delta.data[j - 3] = -step
+                                delta[j] = -float(step)
+                                T_m = SE3_exp(delta) @ T_fd_base
+                                viewpoint.update_RT(
+                                    T_m[:3, :3], T_m[:3, 3]
+                                )
                                 pkg_m = render(
                                     viewpoint,
                                     self.gaussians,
@@ -1235,12 +1255,18 @@ class FrontEnd(mp.Process):
 
                                 dr_pm = r_p - r_m
                                 J_audit[..., j] = dr_pm / (2.0 * step)
+                                viewpoint.update_RT(
+                                    R_fd_base, t_fd_base
+                                )
                                 vm = valid0.to(dtype=dr_pm.dtype)
                                 denom = vm.sum().clamp_min(1.0)
                                 diff_rms[j] = torch.sqrt(
                                     ((dr_pm * dr_pm) * vm).sum() / denom
                                 )
 
+                            viewpoint.update_RT(
+                                R_fd_base, t_fd_base
+                            )
                             viewpoint.cam_trans_delta.data.zero_()
                             viewpoint.cam_rot_delta.data.zero_()
                             diag_audit = tracking_jacobian_diagnostics(
