@@ -352,3 +352,41 @@ The report now separates:
 - M2-A2 tracking observation covariance;
 - M2-A2 posterior covariance;
 - selected absolute covariance.
+
+
+## M2-A2 finite-difference sensitivity audit
+
+The first tracking-covariance experiment produced extremely large
+`P_track`, indicating that the finite-difference Jacobian may be below the
+rasterizer's effective numerical resolution.
+
+M2-A2 therefore records, for every audited frame:
+
+- per-DoF RMS tracking Jacobian magnitude;
+- robust bread-matrix eigenvalues;
+- bread condition number.
+
+An optional sparse epsilon sweep can be enabled:
+
+```yaml
+Uncertainty:
+  m2a2_fd_audit: true
+  m2a2_fd_audit_frames: [50, 200, 400, 600]
+  m2a2_fd_translation_scales: [1.0e-4, 5.0e-4, 1.0e-3, 5.0e-3]
+  m2a2_fd_rotation_scales: [1.0e-4, 5.0e-4, 1.0e-3, 5.0e-3]
+```
+
+Only the listed frames are swept. The normal M2-A2 Jacobian is still computed
+with `m2a2_translation_eps` and `m2a2_rotation_eps`.
+
+Analyze:
+
+```bash
+python scripts/analyze_m2a2_fd_sensitivity.py \
+  results/m2a_pose_uncertainty
+```
+
+A useful finite-difference region should show approximately stable `J_rms`
+as epsilon changes. If `diff_rms` is at or near numerical zero at small
+epsilon and the Jacobian/bread spectrum only becomes stable at larger epsilon,
+the smaller step is below the rasterizer's effective resolution.
