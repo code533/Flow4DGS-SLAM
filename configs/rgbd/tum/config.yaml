@@ -115,3 +115,24 @@ opt_params:
 pipeline_params:
   compute_cov3D_python: false
   convert_SHs_python: false
+
+# M1 probabilistic camera-motion estimation. Disabled by default so the
+# original Flow4DGS-SLAM behavior is preserved unless explicitly enabled.
+Uncertainty:
+  enable_m1: false
+  flow_sigma0_px: 0.5
+  flow_fb_lambda: 1.0
+  flow_max_sigma_px: 20.0
+  depth_sigma0_m: 0.01
+  depth_sigma_rel: 0.0
+  cauchy_c: 2.0
+  damping: 1.0e-6
+  min_pixels: 500
+  residual_rescale: false
+  save_diagnostics: true
+  cluster_covariance: true
+  cluster_block_size: 32
+  cluster_block_sizes: [16, 32, 64]
+  cluster_small_sample_correction: true
+  shadow_mode: true
+  log_keyframe_reasons: true

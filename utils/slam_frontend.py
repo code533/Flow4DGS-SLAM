@@ -17,7 +17,14 @@ from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 import os
 import matplotlib.pyplot as plt
 import random
-from utils.slam_backend import segment_motion_parametric, fit_twist_weighted, pixels_to_flow_units, flow_to_pixels
+from utils.slam_backend import (
+    segment_motion_parametric,
+    fit_twist_weighted,
+    fit_twist_probabilistic,
+    estimate_fb_flow_variance_px,
+    pixels_to_flow_units,
+    flow_to_pixels,
+)
 import torch.nn.functional as F
 from utils.pose_utils import SE3_exp, scale_se3_step, SO3_exp, so3_log
 
@@ -203,6 +210,34 @@ class FrontEnd(mp.Process):
         self.flow_cam_maxt = config["model_params"].get("flow_cam_maxt", 0.01)
         self.flow_cam_maxr = config["model_params"].get("flow_cam_maxr", 0.1)
 
+        # M1: local probabilistic camera-motion estimation. The switch is
+        # deliberately independent of the baseline flow mask so M1 can be
+        # enabled/disabled without changing the rest of the pipeline.
+        unc_cfg = config.get("Uncertainty", {})
+        self.m1_uncertainty = bool(unc_cfg.get("enable_m1", False))
+        self.m1_flow_sigma0_px = float(unc_cfg.get("flow_sigma0_px", 0.5))
+        self.m1_flow_fb_lambda = float(unc_cfg.get("flow_fb_lambda", 1.0))
+        self.m1_flow_max_sigma_px = float(unc_cfg.get("flow_max_sigma_px", 20.0))
+        self.m1_depth_sigma0_m = float(unc_cfg.get("depth_sigma0_m", 0.01))
+        self.m1_depth_sigma_rel = float(unc_cfg.get("depth_sigma_rel", 0.0))
+        self.m1_cauchy_c = float(unc_cfg.get("cauchy_c", 2.0))
+        self.m1_damping = float(unc_cfg.get("damping", 1e-6))
+        self.m1_min_pixels = int(unc_cfg.get("min_pixels", 500))
+        self.m1_residual_rescale = bool(unc_cfg.get("residual_rescale", False))
+        self.m1_save_diagnostics = bool(unc_cfg.get("save_diagnostics", True))
+        self.m1_cluster_covariance = bool(unc_cfg.get("cluster_covariance", True))
+        self.m1_cluster_block_size = int(unc_cfg.get("cluster_block_size", 32))
+        self.m1_cluster_block_sizes = [
+            int(v) for v in unc_cfg.get("cluster_block_sizes", [16, 32, 64])
+        ]
+        self.m1_cluster_small_sample = bool(
+            unc_cfg.get("cluster_small_sample_correction", True)
+        )
+        self.m1_shadow_mode = bool(unc_cfg.get("shadow_mode", True))
+        self.m1_keyframe_reason_log = bool(
+            unc_cfg.get("log_keyframe_reasons", True)
+        )
+
         self.dynamic_objects = 0
 
     def set_hyperparams(self):
@@ -345,8 +380,24 @@ class FrontEnd(mp.Process):
                 render_pkg = render(
                     viewpoint, self.gaussians, self.pipeline_params, self.background, dynamic=False, dx=dxyz, ds=d_scale, dr=d_rot, mask=(self.gaussians.dygs==False))
 
-            flow_back = viewpoint.generate_flow(viewpoint.original_image.cuda(), prev.original_image.cuda(), 
-                                            tracking=True)
+            if self.m1_uncertainty:
+                # M1 needs both flow directions for forward/backward
+                # consistency. Camera.generate_flow(..., tracking=False)
+                # returns (previous->current, current->previous) in the
+                # repository's normalized grid-flow units.
+                flow_fwd, flow_back = viewpoint.generate_flow(
+                    viewpoint.original_image.cuda(),
+                    prev.original_image.cuda(),
+                    tracking=False,
+                    cache=False,
+                )
+            else:
+                flow_back = viewpoint.generate_flow(
+                    viewpoint.original_image.cuda(),
+                    prev.original_image.cuda(),
+                    tracking=True,
+                )
+                flow_fwd = None
             
             depth_tensor = torch.from_numpy(viewpoint.depth).cuda().squeeze().type(torch.float32)
             H, W = depth_tensor.shape
@@ -396,7 +447,78 @@ class FrontEnd(mp.Process):
                 depth_valid = (depth_tensor > 0) & torch.isfinite(depth_tensor)
                 depth_ds, depth_valid_ds, flow_px_ds, Kds = depth_tensor, depth_valid, flow_px, viewpoint.intrinsic.cuda()
                 
-                xi = fit_twist_weighted(depth_ds, flow_px_ds, Kds, static_inliers_ds, robust=True, iters=30)
+                # Preserve the original Flow4DGS pose mean exactly. M1 can
+                # evaluate uncertainty in strict shadow mode without changing
+                # the state trajectory used by tracking, mapping, or keyframe
+                # selection.
+                xi_baseline = fit_twist_weighted(
+                    depth_ds,
+                    flow_px_ds,
+                    Kds,
+                    static_inliers_ds,
+                    robust=True,
+                    iters=30,
+                )
+
+                m1_result = None
+                fb_error_px = None
+                static_prob_mask = static_inliers_ds
+
+                if self.m1_uncertainty:
+                    # The pose refit currently runs at full image resolution,
+                    # so the FB uncertainty is constructed at the same scale.
+                    flow_fwd_px = flow_to_pixels(
+                        flow_fwd.permute(2,0,1), H, W, mode='grid'
+                    )
+
+                    flow_var_px2, fb_valid, fb_error_px = estimate_fb_flow_variance_px(
+                        flow_px_ds,
+                        flow_fwd_px,
+                        sigma0_px=self.m1_flow_sigma0_px,
+                        lambda_fb=self.m1_flow_fb_lambda,
+                        max_sigma_px=self.m1_flow_max_sigma_px,
+                    )
+
+                    static_prob_mask = static_inliers_ds & fb_valid
+
+                    # M1 Version 1 uses a deliberately simple depth-noise
+                    # model. It can later be replaced by a calibrated RGB-D
+                    # sensor model without changing the GLS solver.
+                    depth_sigma = (
+                        self.m1_depth_sigma0_m
+                        + self.m1_depth_sigma_rel * depth_ds.abs()
+                    )
+                    depth_var_m2 = depth_sigma.square()
+
+                    m1_result = fit_twist_probabilistic(
+                        depth_ds,
+                        flow_px_ds,
+                        Kds,
+                        static_prob_mask,
+                        flow_var_px2,
+                        depth_var_m2,
+                        robust=True,
+                        iters=10,
+                        cauchy_c=self.m1_cauchy_c,
+                        damping=self.m1_damping,
+                        residual_rescale=self.m1_residual_rescale,
+                        min_pixels=self.m1_min_pixels,
+                        cluster_covariance=self.m1_cluster_covariance,
+                        cluster_block_size=self.m1_cluster_block_size,
+                        cluster_block_sizes=self.m1_cluster_block_sizes,
+                        cluster_small_sample_correction=self.m1_cluster_small_sample,
+                        fixed_xi=xi_baseline if self.m1_shadow_mode else None,
+                    )
+                    xi = xi_baseline if self.m1_shadow_mode else m1_result["xi"]
+                    viewpoint.pose_cov_rel_raw = m1_result["cov"].detach().cpu()
+                    viewpoint.pose_cov_rel_hessian = m1_result[
+                        "cov_hessian"
+                    ].detach().cpu()
+                    viewpoint.pose_cov_rel_cluster = m1_result[
+                        "cov_cluster"
+                    ].detach().cpu()
+                else:
+                    xi = xi_baseline
 
                 rigid_flow_px = predict_rigid_flow_px(depth_ds, Kds, xi)
                 rigid_flow_out = pixels_to_flow_units(rigid_flow_px, H, W, mode='grid')
@@ -444,6 +566,121 @@ class FrontEnd(mp.Process):
 
                 viewpoint.R = T_curr[:3,:3]
                 viewpoint.T = T_curr[:3, 3]
+
+                if self.m1_uncertainty and m1_result is not None:
+                    # Keep the covariance tied to the raw GLS relative-pose
+                    # estimate. The subsequent Flow4DGS motion cap is a
+                    # baseline heuristic and is logged separately.
+                    P_xi = m1_result["cov"]
+                    P_hessian = m1_result["cov_hessian"]
+                    P_cluster = m1_result["cov_cluster"]
+                    diag = torch.diagonal(P_xi)
+                    sigma_trans = torch.sqrt(diag[:3].clamp_min(0.0))
+                    sigma_rot = torch.sqrt(diag[3:].clamp_min(0.0))
+
+                    if self.m1_save_diagnostics:
+                        m1_dir = os.path.join(
+                            self.config["Results"]["save_dir"],
+                            "m1_pose_uncertainty",
+                        )
+                        os.makedirs(m1_dir, exist_ok=True)
+
+                        if static_prob_mask.any():
+                            fb_median = fb_error_px[static_prob_mask].median()
+                            maha_median = m1_result["maha_map"][static_prob_mask].median()
+                        else:
+                            fb_median = torch.tensor(
+                                float("nan"), device=depth_ds.device, dtype=depth_ds.dtype
+                            )
+                            maha_median = torch.tensor(
+                                float("nan"), device=depth_ds.device, dtype=depth_ds.dtype
+                            )
+
+                        T_rel_applied = torch.linalg.inv(T_prev) @ T_curr
+
+                        # Ground-truth relative pose in the same right-composed
+                        # convention used by the raw Flow4DGS update:
+                        # T_curr = T_prev @ T_rel.
+                        T_prev_gt = torch.eye(
+                            4, device=T_prev.device, dtype=T_prev.dtype
+                        )
+                        T_prev_gt[:3, :3] = prev.R_gt.to(
+                            device=T_prev.device, dtype=T_prev.dtype
+                        )
+                        T_prev_gt[:3, 3] = prev.T_gt.to(
+                            device=T_prev.device, dtype=T_prev.dtype
+                        )
+
+                        T_curr_gt = torch.eye(
+                            4, device=T_prev.device, dtype=T_prev.dtype
+                        )
+                        T_curr_gt[:3, :3] = viewpoint.R_gt.to(
+                            device=T_prev.device, dtype=T_prev.dtype
+                        )
+                        T_curr_gt[:3, 3] = viewpoint.T_gt.to(
+                            device=T_prev.device, dtype=T_prev.dtype
+                        )
+
+                        T_rel_gt = torch.linalg.inv(T_prev_gt) @ T_curr_gt
+
+                        payload = {
+                            "frame": int(viewpoint.uid),
+                            "xi_raw": xi.detach().cpu(),
+                            "xi_baseline": xi_baseline.detach().cpu(),
+                            "xi_probabilistic": m1_result["xi"].detach().cpu(),
+                            "shadow_mode": bool(self.m1_shadow_mode),
+                            "P_xi_raw": P_xi.detach().cpu(),
+                            "P_xi_hessian": P_hessian.detach().cpu(),
+                            "P_xi_cluster": P_cluster.detach().cpu(),
+                            "P_xi_clusters": {
+                                int(bs): P.detach().cpu()
+                                for bs, P in m1_result["cov_clusters"].items()
+                            },
+                            "covariance_mode": m1_result["covariance_mode"],
+                            "cluster_count": int(m1_result["cluster_count"]),
+                            "cluster_counts": {
+                                int(bs): int(n)
+                                for bs, n in m1_result["cluster_counts"].items()
+                            },
+                            "cluster_block_size": int(m1_result["cluster_block_size"]),
+                            "cluster_block_sizes": [
+                                int(bs) for bs in m1_result["cluster_block_sizes"]
+                            ],
+                            "T_rel_raw": T_rel.detach().cpu(),
+                            "T_rel_applied": T_rel_applied.detach().cpu(),
+                            "T_rel_gt": T_rel_gt.detach().cpu(),
+                            "sigma_trans_m": sigma_trans.detach().cpu(),
+                            "sigma_rot_rad": sigma_rot.detach().cpu(),
+                            "kappa": m1_result["kappa"].detach().cpu(),
+                            "condition": m1_result["condition"].detach().cpu(),
+                            "num_pixels": int(m1_result["num_pixels"]),
+                            "valid_extent": float(valid_extent),
+                            "fb_error_median_px": fb_median.detach().cpu(),
+                            "maha_median": maha_median.detach().cpu(),
+                            "motion_scale_joint": s.detach().cpu(),
+                            "motion_scale_translation": s_t.detach().cpu(),
+                        }
+                        torch.save(
+                            payload,
+                            os.path.join(m1_dir, f"{int(viewpoint.uid):06d}.pt"),
+                        )
+
+                    Log(
+                        "M1 frame", viewpoint.uid,
+                        "sigma_t", sigma_trans.detach().cpu().tolist(),
+                        "sigma_r", sigma_rot.detach().cpu().tolist(),
+                        "kappa", float(m1_result["kappa"].detach().cpu()),
+                        "cond", float(m1_result["condition"].detach().cpu()),
+                        "cov", m1_result["covariance_mode"],
+                        "shadow", bool(self.m1_shadow_mode),
+                        "clusters", int(m1_result["cluster_count"]),
+                        "block", int(m1_result["cluster_block_size"]),
+                        "blocks_all", [
+                            int(bs) for bs in m1_result["cluster_block_sizes"]
+                        ],
+                        "N", int(m1_result["num_pixels"]),
+                        tag="Frontend",
+                    )
 
 
 
@@ -773,15 +1010,34 @@ class FrontEnd(mp.Process):
                 if self.single_thread:
                     create_kf = check_time and create_kf
                 
-                create_kf = ((cur_frame_idx - last_keyframe_idx) >= 5) or create_kf or cur_frame_idx == self.dystart
-                
-                
-                
-                if self.dataset.dynamic_objects > self.dynamic_objects and cur_frame_idx>0:
+                forced_by_gap5 = ((cur_frame_idx - last_keyframe_idx) >= 5)
+                forced_by_dystart = (cur_frame_idx == self.dystart)
+                geometric_kf = bool(create_kf)
+                create_kf = forced_by_gap5 or create_kf or forced_by_dystart
+
+                forced_by_new_object = (
+                    self.dataset.dynamic_objects > self.dynamic_objects
+                    and cur_frame_idx > 0
+                )
+                if forced_by_new_object:
                     create_kf = True
                     new_object = True
                 else:
                     new_object = False
+
+                if self.m1_keyframe_reason_log and create_kf:
+                    Log(
+                        "KF reason",
+                        "frame", int(cur_frame_idx),
+                        "last", int(last_keyframe_idx),
+                        "gap", int(cur_frame_idx - last_keyframe_idx),
+                        "check_time", bool(check_time),
+                        "geometry", bool(geometric_kf),
+                        "gap5", bool(forced_by_gap5),
+                        "dystart", bool(forced_by_dystart),
+                        "new_object", bool(forced_by_new_object),
+                        tag="Frontend",
+                    )
                     
                 if create_kf:
                     keyframe_list.append(cur_frame_idx)

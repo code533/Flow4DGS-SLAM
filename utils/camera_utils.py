@@ -440,8 +440,8 @@ class Camera(nn.Module):
 
         return selected_keyframe_list
         
-    def generate_flow(self, image, image_last, tracking=False, ds=1, return_full=False):
-        if not tracking:
+    def generate_flow(self, image, image_last, tracking=False, ds=1, return_full=False, cache=True):
+        if not tracking and cache:
             if self.flow is not None:
                 return self.flow, self.flow_back
 
@@ -486,12 +486,21 @@ class Camera(nn.Module):
             coor1to2_flow_back_final = coor1to2_flow_back
 
         if not tracking:
-            self.flow = coor1to2_flow_final
-            self.flow_back = coor1to2_flow_back_final
-            if not return_full:
-                return self.flow, self.flow_back
+            if cache:
+                self.flow = coor1to2_flow_final
+                self.flow_back = coor1to2_flow_back_final
+                if not return_full:
+                    return self.flow, self.flow_back
+                else:
+                    return coor1to2_flow, coor1to2_flow_back
             else:
-                return coor1to2_flow, coor1to2_flow_back
+                # M1 shadow-mode calls use cache=False so the temporary
+                # current<->previous flow pair cannot pollute the flow cache
+                # later consumed by backend mapping against a keyframe.
+                if not return_full:
+                    return coor1to2_flow_final, coor1to2_flow_back_final
+                else:
+                    return coor1to2_flow, coor1to2_flow_back
         else:
             # self.flow_back_mini = coor1to2_flow_back
             return coor1to2_flow_back
