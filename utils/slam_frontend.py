@@ -33,6 +33,7 @@ from utils.m2_uncertainty import (
     propagate_right_pose_covariance,
     relative_parameter_cov_to_right,
 )
+from utils.m1_mapping_uncertainty import M1MappingSignal
 from utils.m2_tracking_uncertainty import (
     apply_tracking_diag6_calibration,
     build_tracking_residual_context,
@@ -254,6 +255,37 @@ class FrontEnd(mp.Process):
         self.m1_keyframe_reason_log = bool(
             unc_cfg.get("log_keyframe_reasons", True)
         )
+
+        # Experimental M1 -> mapping intervention. Disabled unless explicitly
+        # enabled, so the existing M1/M2 shadow path remains behavior-preserving.
+        self.m1_mapping_weighting = bool(
+            unc_cfg.get("m1_mapping_weighting", False)
+        )
+        self.m1_mapping_signal = None
+        if self.m1_mapping_weighting:
+            if not self.m1_uncertainty:
+                raise ValueError("m1_mapping_weighting requires enable_m1=true")
+            signal_file = unc_cfg.get("m1_mapping_signal_file")
+            signal_fold = unc_cfg.get("m1_mapping_signal_fold")
+            if not signal_file or not signal_fold:
+                raise ValueError(
+                    "m1_mapping_weighting requires m1_mapping_signal_file and "
+                    "m1_mapping_signal_fold"
+                )
+            self.m1_mapping_signal = M1MappingSignal(
+                signal_file=signal_file,
+                fold=signal_fold,
+                eig_floor_rel=float(
+                    unc_cfg.get("m1_mapping_eig_floor_rel", 1.0e-10)
+                ),
+                eps=float(unc_cfg.get("m1_mapping_eps", 1.0e-6)),
+            )
+            if self.m1_mapping_signal.block_size not in self.m1_cluster_block_sizes:
+                raise ValueError(
+                    "Runtime mapping signal requires M1 cluster block size "
+                    f"{self.m1_mapping_signal.block_size}, but configured sizes are "
+                    f"{self.m1_cluster_block_sizes}"
+                )
 
         # M2-A: shadow-only propagation of absolute camera-pose uncertainty.
         # It does not alter the baseline pose mean, losses, keyframes, mapping,
@@ -764,6 +796,23 @@ class FrontEnd(mp.Process):
                     viewpoint.pose_cov_rel_cluster = m1_result[
                         "cov_cluster"
                     ].detach().cpu()
+
+                    if self.m1_mapping_weighting:
+                        block_size = self.m1_mapping_signal.block_size
+                        cov_for_mapping = m1_result["cov_clusters"].get(block_size)
+                        if cov_for_mapping is None:
+                            raise KeyError(
+                                f"M1 runtime result has no cluster covariance for "
+                                f"block size {block_size}"
+                            )
+                        mapping_signal = self.m1_mapping_signal.evaluate(
+                            cov_for_mapping.detach().cpu()
+                        )
+                        viewpoint.m1_mapping_confidence = mapping_signal["confidence"]
+                        viewpoint.m1_mapping_u = mapping_signal["u"]
+                        viewpoint.m1_mapping_sigma_t = mapping_signal["sigma_t"]
+                        viewpoint.m1_mapping_sigma_r = mapping_signal["sigma_r"]
+                        viewpoint.m1_mapping_valid = True
                 else:
                     xi = xi_baseline
 
