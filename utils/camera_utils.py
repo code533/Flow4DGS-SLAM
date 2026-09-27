@@ -65,6 +65,16 @@ class Camera(nn.Module):
         self.pose_cov_valid = False
         self.pose_cov_source = None
 
+        # M1 mapping reliability. Frame 0 has no preceding relative-motion
+        # estimate, so it starts at the training-median neutral confidence 1.
+        # Later frames are populated only for the explicitly enabled mapping
+        # experiment.
+        self.m1_mapping_confidence = 1.0
+        self.m1_mapping_u = 1.0
+        self.m1_mapping_sigma_t = None
+        self.m1_mapping_sigma_r = None
+        self.m1_mapping_valid = False
+
         self.original_image = color
         self.depth = depth
         self.depth_mask = np.isfinite(depth) & (depth > 0.0)
