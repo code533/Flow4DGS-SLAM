@@ -524,6 +524,33 @@ class GaussianModel:
             
             motion_mask_points = torch.from_numpy(in_motion_full[keep_mask]).to(torch.bool).cuda()
 
+        # Guard the empty-point-cloud case before calling CUDA KNN.
+        #
+        # This can legitimately happen for the second initialization pass
+        # (add_dygs=True): after masking static pixels there may be no dynamic
+        # depth left in the frame.  The custom distCUDA2 kernel does not accept
+        # N=0 and otherwise fails with "CUDA error: invalid configuration
+        # argument".  Returning typed empty tensors is safe because
+        # extend_from_pcd_seq() already skips extension when N == 0.
+        if new_xyz.shape[0] == 0:
+            device = torch.device("cuda")
+            sh_dim = (self.max_sh_degree + 1) ** 2
+            scale_dim = 1 if self.isotropic else 3
+            print(
+                "[GaussianModel] skip empty point cloud",
+                f"frame={getattr(cam, 'uid', 'unknown')}",
+                f"init={init}",
+                f"new_mask={new_mask is not None}",
+            )
+            return (
+                torch.empty((0, 3), dtype=torch.float32, device=device),
+                torch.empty((0, 3, sh_dim), dtype=torch.float32, device=device),
+                torch.empty((0, scale_dim), dtype=torch.float32, device=device),
+                torch.empty((0, 4), dtype=torch.float32, device=device),
+                torch.empty((0, 1), dtype=torch.float32, device=device),
+                torch.empty((0,), dtype=torch.bool, device=device),
+            )
+
         # Keep on self
         pcd = BasicPointCloud(points=new_xyz, colors=new_rgb, normals=np.zeros((new_xyz.shape[0], 3)))
         self.ply_input = pcd
@@ -855,6 +882,12 @@ class GaussianModel:
         if fused_point_cloud.shape[0] > 0:
             self.extend_from_pcd(
                 fused_point_cloud, features, scales, rots, opacities, kf_id, add_dygs, motion_pts_mask=motion_pts_mask,
+            )
+        else:
+            print(
+                "[GaussianModel] no points to extend",
+                f"kf_id={kf_id}",
+                f"add_dygs={add_dygs}",
             )
 
     def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float=5., print_info=True, max_point_num=150_000):
