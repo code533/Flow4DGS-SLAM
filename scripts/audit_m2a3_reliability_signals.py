@@ -204,6 +204,15 @@ def extract_m2_features(d):
 
     f.update(matrix_stats(d.get("P_track_right_raw"), "m2_track_cov"))
     f.update(matrix_stats(d.get("P_abs_prior_right"), "m2_prior_cov"))
+
+    # M2-A3 absolute observation/map consistency diagnostics.  These retain
+    # final residual magnitude and coverage, unlike M2-A2's MAD scales.
+    obs = d.get("m2a3_observation_diag")
+    if isinstance(obs, dict):
+        for key, value in obs.items():
+            z = scalar(value)
+            if z is not None:
+                f[f"m2a3_{key}"] = z
     return f
 
 
