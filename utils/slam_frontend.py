@@ -42,6 +42,7 @@ from utils.m2_tracking_uncertainty import (
     load_tracking_diag6_calibration_report,
     tracking_jacobian_diagnostics,
     tracking_residual_tensor,
+    tracking_absolute_residual_diagnostics,
 )
 
 
@@ -580,6 +581,7 @@ class FrontEnd(mp.Process):
         m2a2_post_right = None
         m2a2_stats = None
         m2a2_fd_audit_payload = None
+        m2a3_observation_diag = None
         
         opt_params = []
         opt_params.append(
@@ -1137,6 +1139,17 @@ class FrontEnd(mp.Process):
                 residual0, valid0 = tracking_residual_tensor(
                     final_static_pkg, viewpoint, track_context
                 )
+                # M2-A3 diagnostic only: retain absolute final-pose
+                # observation consistency instead of only the MAD scales used
+                # to normalize M2-A2 covariance residuals.
+                m2a3_observation_diag = (
+                    tracking_absolute_residual_diagnostics(
+                        final_static_pkg,
+                        viewpoint,
+                        track_context,
+                        initial_loss=loss_tracking_init,
+                    )
+                )
 
                 C, H, W = residual0.shape
                 J_track = torch.empty(
@@ -1628,6 +1641,17 @@ class FrontEnd(mp.Process):
                                 track_context["depth_scale"].detach().cpu()
                                 if self.m2a2_enable
                                 and m2a2_stats is not None
+                                else None
+                            ),
+                            "m2a3_observation_diag": (
+                                {
+                                    key: value.detach().cpu()
+                                    if isinstance(value, torch.Tensor)
+                                    else value
+                                    for key, value in
+                                    m2a3_observation_diag.items()
+                                }
+                                if m2a3_observation_diag is not None
                                 else None
                             ),
                         },
