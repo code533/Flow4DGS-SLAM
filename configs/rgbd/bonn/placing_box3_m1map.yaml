@@ -1,0 +1,14 @@
+inherit_from: "configs/rgbd/bonn/placing_box3.yaml"
+
+Uncertainty:
+  # Runtime intervention: only per-keyframe RGB-D mapping supervision is
+  # reweighted. Tracking, keyframe selection, Gaussian insertion/pruning,
+  # flow/mask losses, and M2 shadow diagnostics keep their existing behavior.
+  m1_mapping_weighting: true
+  m1_mapping_signal_file: results/m1_mapping_signal_bonn_loso.json
+  m1_mapping_signal_fold: placing_box3
+  m1_mapping_eig_floor_rel: 1.0e-10
+  m1_mapping_eps: 1.0e-6
+  m1_mapping_clip_min: 0.25
+  m1_mapping_clip_max: 4.0
+  m1_mapping_log_every: 50
