@@ -31,7 +31,17 @@ python scripts/audit_m2a3_reliability_signals.py \
 import argparse
 import json
 import math
+import sys
 from pathlib import Path
+
+# When a repository script is executed as
+#   python scripts/<name>.py
+# Python places scripts/ rather than the repository root on sys.path.
+# Add the root explicitly so local utils imports work without requiring
+# callers to set PYTHONPATH.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import torch
 
