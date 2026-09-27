@@ -355,7 +355,18 @@ class GaussianModel:
             depth = o3d.geometry.Image(depth_raw.astype(np.float32))
         if add_dygs:
             depth = np.copy(cam_info.depth)
-            depth[cam.motion_mask.cpu().numpy()] = 0
+            static_mask = cam.motion_mask.detach().cpu().numpy().astype(bool)
+            valid_depth = np.isfinite(depth) & (depth > 0.0)
+            dynamic_mask = ~static_mask
+            print(
+                "[BonnBaselineAudit] dynamic-init input "
+                f"uid={getattr(cam_info, 'uid', None)} "
+                f"valid_depth={int(valid_depth.sum())} "
+                f"static_pixels={int(static_mask.sum())} "
+                f"dynamic_pixels={int(dynamic_mask.sum())} "
+                f"valid_dynamic_depth={int((valid_depth & dynamic_mask).sum())}"
+            )
+            depth[static_mask] = 0
             depth = o3d.geometry.Image(depth.astype(np.float32))
         return self.create_pcd_from_image_and_depth(cam, rgb, depth, init, new_mask=new_mask)
 
@@ -523,6 +534,15 @@ class GaussianModel:
             new_rgb = all_rgb[keep_mask]
             
             motion_mask_points = torch.from_numpy(in_motion_full[keep_mask]).to(torch.bool).cuda()
+
+        if new_xyz.shape[0] == 0:
+            print(
+                "[BonnBaselineAudit] empty point cloud before CUDA KNN "
+                f"uid={getattr(cam, 'uid', None)} init={bool(init)} "
+                f"new_mask={new_mask is not None} "
+                f"depth_valid={int((np.isfinite(depth_m) & (depth_m > 0.0)).sum())} "
+                f"downsample_factor={downsample_factor}"
+            )
 
         # Keep on self
         pcd = BasicPointCloud(points=new_xyz, colors=new_rgb, normals=np.zeros((new_xyz.shape[0], 3)))
