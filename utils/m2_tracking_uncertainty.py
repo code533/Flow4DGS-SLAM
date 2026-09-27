@@ -192,8 +192,161 @@ def build_tracking_residual_context(
         "depth_scale": depth_scale.detach(),
         "rgb_weight": rgb_weight,
         "depth_weight": depth_weight,
+        "alpha": alpha,
         "H": H,
         "W": W,
+    }
+
+
+def tracking_absolute_residual_diagnostics(
+    render_pkg,
+    viewpoint,
+    context,
+    initial_loss=None,
+):
+    """Absolute final-pose RGB-D consistency diagnostics for M2-A3.
+
+    Unlike the MAD scales used to normalize the M2-A2 covariance residuals,
+    these statistics retain absolute residual magnitude.  They are diagnostic
+    only and do not affect tracking, mapping, covariance estimation, or fusion.
+    """
+
+    image = render_pkg["render"]
+    depth = render_pkg["depth"]
+    opacity = render_pkg["opacity"]
+
+    image_ab = (
+        torch.exp(viewpoint.exposure_a.detach()) * image
+        + viewpoint.exposure_b.detach()
+    )
+    rgb_abs_map = (image_ab - context["gt_image"]).abs()
+    depth_abs_map = (depth - context["gt_depth"]).abs()
+
+    rgb_valid = context["rgb_mask"].expand(3, -1, -1)
+    depth_valid = context["depth_mask"]
+
+    def values_or_empty(x, mask):
+        values = x[mask]
+        return values[torch.isfinite(values)]
+
+    def q(values, quantile):
+        if values.numel() == 0:
+            return torch.tensor(
+                float("nan"), device=x_device, dtype=x_dtype
+            )
+        return torch.quantile(values, float(quantile))
+
+    def mean(values):
+        if values.numel() == 0:
+            return torch.tensor(
+                float("nan"), device=x_device, dtype=x_dtype
+            )
+        return values.mean()
+
+    def ratio(mask):
+        if mask.numel() == 0:
+            return torch.tensor(
+                float("nan"), device=x_device, dtype=x_dtype
+            )
+        return mask.to(dtype=x_dtype).mean()
+
+    x_device = image.device
+    x_dtype = image.dtype
+
+    rgb_abs = values_or_empty(rgb_abs_map, rgb_valid)
+    rgb_weighted_abs = values_or_empty(
+        opacity.expand_as(rgb_abs_map) * rgb_abs_map,
+        rgb_valid,
+    )
+    depth_abs = values_or_empty(depth_abs_map, depth_valid)
+    depth_rel_map = depth_abs_map / context["gt_depth"].abs().clamp_min(0.05)
+    depth_rel = values_or_empty(depth_rel_map, depth_valid)
+
+    # Potential static depth support before the opacity > 0.95 gate.  This
+    # separates "the render is wrong" from "the map has no confident support".
+    potential_depth = (
+        (context["gt_depth"] > 0.01)
+        & (context["gt_depth"] < 1000.0)
+    )
+    if (
+        viewpoint.motion_mask is not None
+        and viewpoint.uid > 0
+    ):
+        motion = viewpoint.motion_mask.to(device=x_device).bool()
+        potential_depth = potential_depth & motion.view_as(potential_depth)
+
+    potential_count = potential_depth.sum().to(dtype=x_dtype)
+    depth_count = depth_valid.sum().to(dtype=x_dtype)
+    depth_opacity_coverage = depth_count / potential_count.clamp_min(1.0)
+
+    rgb_support = context["rgb_mask"]
+    rgb_support_count = rgb_support.sum().to(dtype=x_dtype)
+    rgb_high_opacity = (
+        rgb_support & (opacity.detach() > 0.95).view_as(rgb_support)
+    ).sum().to(dtype=x_dtype)
+    rgb_opacity_coverage = (
+        rgb_high_opacity / rgb_support_count.clamp_min(1.0)
+    )
+    opacity_on_rgb = values_or_empty(
+        opacity.detach(), rgb_support
+    )
+
+    alpha = float(context.get("alpha", 0.95))
+    rgb_loss_map = (
+        opacity.detach()
+        * rgb_abs_map
+        * rgb_valid.to(dtype=x_dtype)
+    )
+    depth_loss_map = (
+        depth_abs_map
+        * depth_valid.to(dtype=x_dtype)
+    )
+    final_loss = (
+        alpha * rgb_loss_map.mean()
+        + (1.0 - alpha) * depth_loss_map.mean()
+    )
+
+    if initial_loss is None or not math.isfinite(float(initial_loss)):
+        init_loss = torch.tensor(
+            float("nan"), device=x_device, dtype=x_dtype
+        )
+        relative_improvement = init_loss.clone()
+    else:
+        init_loss = torch.tensor(
+            float(initial_loss), device=x_device, dtype=x_dtype
+        )
+        relative_improvement = (
+            (init_loss - final_loss)
+            / init_loss.abs().clamp_min(1e-12)
+        )
+
+    return {
+        "rgb_abs_mean": mean(rgb_abs),
+        "rgb_abs_median": q(rgb_abs, 0.50),
+        "rgb_abs_p90": q(rgb_abs, 0.90),
+        "rgb_abs_p95": q(rgb_abs, 0.95),
+        "rgb_weighted_abs_median": q(rgb_weighted_abs, 0.50),
+        "rgb_inlier_ratio_0p05": ratio(rgb_abs < 0.05),
+        "rgb_inlier_ratio_0p10": ratio(rgb_abs < 0.10),
+        "depth_abs_mean_m": mean(depth_abs),
+        "depth_abs_median_m": q(depth_abs, 0.50),
+        "depth_abs_p90_m": q(depth_abs, 0.90),
+        "depth_abs_p95_m": q(depth_abs, 0.95),
+        "depth_rel_median": q(depth_rel, 0.50),
+        "depth_inlier_ratio_0p05m": ratio(depth_abs < 0.05),
+        "depth_inlier_ratio_0p10m": ratio(depth_abs < 0.10),
+        "depth_opacity_coverage": depth_opacity_coverage,
+        "rgb_opacity_coverage": rgb_opacity_coverage,
+        "opacity_median_rgb_support": q(opacity_on_rgb, 0.50),
+        "rgb_valid_values": torch.tensor(
+            int(rgb_abs.numel()), device=x_device, dtype=x_dtype
+        ),
+        "depth_valid_values": torch.tensor(
+            int(depth_abs.numel()), device=x_device, dtype=x_dtype
+        ),
+        "tracking_loss_initial": init_loss,
+        "tracking_loss_final": final_loss,
+        "tracking_loss_relative_improvement": relative_improvement,
     }
 
 
