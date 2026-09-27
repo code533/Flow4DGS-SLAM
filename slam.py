@@ -70,7 +70,10 @@ class SLAM:
 
         start.record()
 
-        if config["model_params"]["dynamic_model"] == 'offset':
+        # Respect an explicit per-sequence dynamic-start frame (e.g. Bonn).
+        # Keep the historical offset-model default of frame 0 only when the
+        # configuration does not provide a dystart value.
+        if config["model_params"]["dynamic_model"] == 'offset' and "dystart" not in config["Training"]:
             config['Training']['dystart'] = 0
 
         self.config = config
