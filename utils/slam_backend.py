@@ -1,5 +1,6 @@
 import random
 import time
+from utils.m1_mapping_uncertainty import normalized_window_weights
 
 import torch
 import torch.multiprocessing as mp
@@ -779,6 +780,12 @@ class BackEnd(mp.Process):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        unc_cfg = config.get("Uncertainty", {})
+        self.m1_mapping_weighting = bool(unc_cfg.get("m1_mapping_weighting", False))
+        self.m1_mapping_clip_min = float(unc_cfg.get("m1_mapping_clip_min", 0.25))
+        self.m1_mapping_clip_max = float(unc_cfg.get("m1_mapping_clip_max", 4.0))
+        self.m1_mapping_log_every = int(unc_cfg.get("m1_mapping_log_every", 50))
+        self.m1_mapping_call_count = 0
         self.gaussians = None
         self.pipeline_params = None
         self.opt_params = None
@@ -1099,6 +1106,39 @@ class BackEnd(mp.Process):
         key_opt = current_window[:3] + key_opt
         
         self.viewpoint_stack = [self.viewpoints[kf_idx] for kf_idx in key_opt]
+
+        # Normalize M1 confidence over the actual RGB-D mapping viewpoints.
+        # Missing/invalid confidence (including frame 0) is neutral. Only the
+        # per-view RGB-D mapping term is weighted; flow/mask/regularizers keep
+        # their baseline coefficients.
+        rgbd_mapping_weights = [1.0] * len(self.viewpoint_stack)
+        if self.m1_mapping_weighting:
+            confidences = []
+            for vp in self.viewpoint_stack:
+                conf = float(getattr(vp, "m1_mapping_confidence", 1.0))
+                valid = bool(getattr(vp, "m1_mapping_valid", False))
+                if (not valid) or (not np.isfinite(conf)) or conf <= 0.0:
+                    conf = 1.0
+                confidences.append(conf)
+            rgbd_mapping_weights = normalized_window_weights(
+                confidences,
+                clip_min=self.m1_mapping_clip_min,
+                clip_max=self.m1_mapping_clip_max,
+            )
+            self.m1_mapping_call_count += 1
+            if (
+                self.m1_mapping_log_every > 0
+                and self.m1_mapping_call_count % self.m1_mapping_log_every == 0
+            ):
+                Log(
+                    "M1 RGB-D weights "
+                    + ", ".join(
+                        f"{vp.uid}:{w:.3f}"
+                        for vp, w in zip(self.viewpoint_stack, rgbd_mapping_weights)
+                    ),
+                    tag="Backend",
+                )
+
         random_viewpoint_stack = []
         frames_to_optimize = self.config["Training"]["pose_window"]
         current_window_set = set(key_opt)
@@ -1396,14 +1436,16 @@ class BackEnd(mp.Process):
                                 viewpoint.save_flow(motion_start[cam_idx], coor2to1_motion, gt=flow, save_path=os.path.join(output_dir, f"mapping_{viewpoint.uid}_flow_start.png"))
                             else:
                                 viewpoint.save_flow(motion_start[cam_idx], coor2to1_motion, gt=flow, save_path=os.path.join(output_dir, f"mapping_{viewpoint.uid}_flow_{max(current_window)}.png"))
-                    loss_mapping += get_loss_mapping(
+                    rgbd_loss = get_loss_mapping(
                         self.config, image, depth, viewpoint, opacity, rm_dynamic=not (dynamic_network or dynamic_render), dynamic=dynamic
                     )
+                    loss_mapping += rgbd_mapping_weights[cam_idx] * rgbd_loss
                         
                 else:
-                    loss_mapping += get_loss_mapping(
+                    rgbd_loss = get_loss_mapping(
                         self.config, image, depth, viewpoint, opacity, rm_dynamic=not (dynamic_network or dynamic_render),
                     )
+                    loss_mapping += rgbd_mapping_weights[cam_idx] * rgbd_loss
                 if dynamic_network and self.gaussians.deform_init and (self.dynamic_model == 'mlp'):
                     loss_network += 1e-3 * self.gaussians.deform.deform.arap_loss(t=viewpoint.fid, delta_t=delta*self.gaussians.time_interval, t_samp_num=4)
                     loss_network += 1e-3 * self.gaussians.deform.deform.elastic_loss(t=viewpoint.fid, delta_t=5*self.gaussians.time_interval)
