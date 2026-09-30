@@ -1,4 +1,15 @@
-inherit_from: "configs/rgbd/bonn/placing_box.yaml"
+# Self-contained Bonn M1-mapping experiment overlay.
+# Inherit directly from the valid Bonn base used by the command-line protocol;
+# do not chain through placing_box*.yaml, whose historical inherit_from points
+# at the absent configs/rgbd/bonn/base_config.yaml.
+inherit_from: "configs/rgbd/bonn/config.yaml"
+
+Dataset:
+  dataset_path: "datasets/bonn/rgbd_bonn_placing_nonobstructing_box"
+
+Training:
+  single_thread: true
+  dystart: 241
 
 Uncertainty:
   # Runtime intervention: only per-keyframe RGB-D mapping supervision is
