@@ -9,6 +9,7 @@ from tqdm import tqdm
 from gaussian_splatting.gaussian_renderer import render, render_flow
 from gaussian_splatting.utils.loss_utils import l1_loss, ssim, gradient_loss_flow
 from utils.logging_utils import Log
+from utils.reproducibility import seed_everything
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_mapping, get_loss_network, pearson_loss
@@ -2414,6 +2415,10 @@ class BackEnd(mp.Process):
     
     ## backend thread
     def run(self):
+        # spawn() starts a fresh interpreter; seed each worker explicitly.
+        seed = int(self.config.get("Experiment", {}).get("seed", 0))
+        seed_everything(seed)
+        Log(f"RNG seed: {seed}", tag="Backend")
         while True:
             if self.backend_queue.empty():
                 if self.pause:
