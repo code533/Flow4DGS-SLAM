@@ -10,6 +10,7 @@ from gui import gui_utils
 from utils.camera_utils import Camera
 from utils.eval_utils import eval_ate, save_gaussians
 from utils.logging_utils import Log
+from utils.reproducibility import seed_everything
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_tracking, get_median_depth, get_loss_network, pearson_loss
@@ -1869,6 +1870,10 @@ class FrontEnd(mp.Process):
     
             
     def run(self):
+        # spawn() starts a fresh interpreter; seed each worker explicitly.
+        seed = int(self.config.get("Experiment", {}).get("seed", 0))
+        seed_everything(seed)
+        Log(f"RNG seed: {seed}", tag="Frontend")
         # init
         cur_frame_idx = 0
         last_keyframe_idx = 0
