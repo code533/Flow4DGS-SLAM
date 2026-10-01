@@ -19,6 +19,7 @@ from utils.config_utils import load_config
 from utils.dataset import load_dataset
 from utils.eval_utils import eval_ate, eval_rendering, save_gaussians
 from utils.logging_utils import Log
+from utils.reproducibility import seed_everything
 from utils.multiprocessing_utils import FakeQueue
 from utils.slam_backend import BackEnd
 from utils.slam_frontend import FrontEnd
@@ -347,16 +348,21 @@ if __name__ == "__main__":
     parser.add_argument('--load_path', type=str, default=None)
     parser.add_argument('--rigid_loss', type=int, default=4.0)
     parser.add_argument("--save_results", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Seed Python/NumPy/PyTorch RNG streams for controlled ablations.")
 
     args = parser.parse_args(sys.argv[1:])
 
     mp.set_start_method("spawn")
+    seed_everything(args.seed)
+    Log(f"Experiment RNG seed: {args.seed}")
 
     with open(args.config, "r") as yml:
         config = yaml.safe_load(yml)
 
     config = load_config(args.config, inherit_from=args.inherit_from)
     config['yolo'] = bool(args.yolo)
+    config.setdefault("Experiment", {})["seed"] = int(args.seed)
     save_dir = None
 
     if args.eval:
