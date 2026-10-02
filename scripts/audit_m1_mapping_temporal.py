@@ -1,26 +1,31 @@
 #!/usr/bin/env python3
-"""Temporal audit for M1 uncertainty-aware mapping.
+"""Temporal concentration-vs-divergence audit for M1 mapping v1.
 
-Consumes the corrected output of audit_m1_mapping_failure.py and asks a narrow
-question: does strong runtime mapping-weight concentration temporally precede
-larger weighted-vs-shadow pose-error gaps?
+Uses runtime mapping weights from the corrected failure audit, but loads the full
+per-frame M2-A diagnostic trajectories directly from each run directory. This
+avoids the severe sampling bias of restricting pose comparison to frames that
+happen to occur in both runs' mapping windows.
 
-This script is diagnostic, not an inferential significance test. Mapping calls
-and repeated keyframe appearances are temporally dependent, and shadow/weighted
-runs are independently gauge-aligned. Reported correlations therefore describe
-association and temporal ordering only; they do not establish causality.
-
-The audit deliberately does NOT change SLAM, M1 calibration, clipping, or the
-weight formula.
+Diagnostic only: mapping calls overlap and are temporally dependent, and the two
+runs are independently gauge-aligned. Associations below describe temporal
+ordering; they do not establish causality.
 """
 
 import argparse
 import csv
 import json
 import math
+import sys
 from pathlib import Path
 
 import numpy as np
+import torch
+
+REPO = Path(__file__).resolve().parents[1]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+from utils.m2_uncertainty import SE3_log
 
 
 def finite(x):
@@ -48,7 +53,7 @@ def spearman(x, y):
     pairs = [(float(a), float(b)) for a, b in zip(x, y) if finite(a) and finite(b)]
     if len(pairs) < 3:
         return float("nan"), len(pairs)
-    xx, yy = map(np.asarray, zip(*pairs))
+    xx, yy = zip(*pairs)
     rx, ry = rankdata(xx), rankdata(yy)
     if np.std(rx) == 0 or np.std(ry) == 0:
         return float("nan"), len(pairs)
@@ -60,75 +65,87 @@ def quantiles(values):
     if x.size == 0:
         return {"count": 0}
     return {
-        "count": int(x.size),
-        "mean": float(x.mean()),
-        "std": float(x.std()),
-        "min": float(x.min()),
-        "q05": float(np.quantile(x, 0.05)),
-        "q25": float(np.quantile(x, 0.25)),
-        "median": float(np.median(x)),
-        "q75": float(np.quantile(x, 0.75)),
-        "q95": float(np.quantile(x, 0.95)),
+        "count": int(x.size), "mean": float(x.mean()), "std": float(x.std()),
+        "min": float(x.min()), "q05": float(np.quantile(x, .05)),
+        "q25": float(np.quantile(x, .25)), "median": float(np.median(x)),
+        "q75": float(np.quantile(x, .75)), "q95": float(np.quantile(x, .95)),
         "max": float(x.max()),
     }
 
 
-def load_unique_pose_rows(path, run_name):
-    """Return one pose/observation row per frame, checking duplicate consistency."""
-    by_frame = {}
-    fields = [
-        "pose_center_error_m",
-        "pose_log_translation_error_m",
-        "pose_rotation_error_rad",
-        "rgb_abs_median",
-        "depth_abs_median_m",
-    ]
-    with path.open(newline="") as f:
-        for row in csv.DictReader(f):
-            if row.get("run") != run_name:
-                continue
-            frame = int(row["frame"])
-            vals = {}
-            for key in fields:
-                if finite(row.get(key)):
-                    vals[key] = float(row[key])
-            if not vals:
-                continue
-            if frame in by_frame:
-                # A frame can appear in many mapping windows. Its saved pose diagnostic
-                # must be identical each time; fail rather than silently average conflicts.
-                for key, value in vals.items():
-                    if key in by_frame[frame] and abs(by_frame[frame][key] - value) > 1e-10:
-                        raise RuntimeError(
-                            f"Inconsistent {key} for {run_name} frame {frame}: "
-                            f"{by_frame[frame][key]} vs {value}"
-                        )
-                by_frame[frame].update(vals)
-            else:
-                by_frame[frame] = vals
-    if not by_frame:
-        raise RuntimeError(f"No pose diagnostics found for run={run_name} in {path}")
-    return by_frame
+def fit_se3_alignment(est_xyz, gt_xyz):
+    xbar, ybar = est_xyz.mean(axis=0), gt_xyz.mean(axis=0)
+    X, Y = est_xyz - xbar, gt_xyz - ybar
+    U, _, Vt = np.linalg.svd(X.T @ Y)
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+    t = ybar - R @ xbar
+    A = np.eye(4, dtype=np.float64)
+    A[:3, :3], A[:3, 3] = R, t
+    return A
 
 
-def event_records(run_json, use_actual):
+def load_full_pose_trajectory(directory):
+    directory = Path(directory)
+    if not directory.is_dir():
+        raise FileNotFoundError(f"M2-A diagnostic directory does not exist: {directory}")
+    samples = []
+    for path in sorted(directory.glob("*.pt")):
+        d = torch.load(path, map_location="cpu")
+        T, G = d.get("T_final"), d.get("T_gt")
+        if not isinstance(T, torch.Tensor) or not isinstance(G, torch.Tensor):
+            continue
+        if tuple(T.shape) != (4, 4) or tuple(G.shape) != (4, 4):
+            continue
+        T, G = T.double(), G.double()
+        if not bool(torch.isfinite(T).all() and torch.isfinite(G).all()):
+            continue
+        samples.append({
+            "frame": int(d.get("frame", int(path.stem))),
+            "T": T,
+            "G": G,
+        })
+    if len(samples) < 10:
+        raise RuntimeError(f"Only {len(samples)} usable full-pose diagnostics in {directory}")
+
+    est_xyz = np.stack([torch.linalg.inv(s["T"])[:3, 3].numpy() for s in samples])
+    gt_xyz = np.stack([torch.linalg.inv(s["G"])[:3, 3].numpy() for s in samples])
+    A_np = fit_se3_alignment(est_xyz, gt_xyz)
+    A = torch.from_numpy(A_np).double()
+    Ainv = torch.linalg.inv(A)
+
+    out = {}
+    for s in samples:
+        T_aligned = s["T"] @ Ainv
+        C = torch.linalg.inv(T_aligned)[:3, 3]
+        Cg = torch.linalg.inv(s["G"])[:3, 3]
+        e = SE3_log(torch.linalg.inv(T_aligned) @ s["G"])
+        out[s["frame"]] = {
+            "pose_center_error_m": float(torch.linalg.norm(C - Cg)),
+            "pose_log_translation_error_m": float(torch.linalg.norm(e[:3])),
+            "pose_rotation_error_rad": float(torch.linalg.norm(e[3:])),
+        }
+    return out, A_np.tolist(), len(samples)
+
+
+def event_records(run_json):
     out = []
     for e in run_json["events"]:
         frames = e.get("frames", [])
-        if not frames:
+        weights = e.get("actual_weights", [])
+        if not frames or not weights:
             continue
-        current_frame = int(frames[0])
-        ess_key = "ess_actual" if use_actual else "ess_candidate"
-        ess = float(e[ess_key])
-        weights = e["actual_weights"] if use_actual else e["candidate_weights"]
         n = len(weights)
-        concentration = 1.0 - ess / max(1, n)
+        ess = float(e["ess_actual"])
         out.append({
             "map_call": int(e["map_call"]),
-            "current_frame": current_frame,
+            # Backend prints the current/newest keyframe first in the current window.
+            "current_frame": int(frames[0]),
             "window_size": n,
             "ess": ess,
-            "concentration": concentration,
+            "concentration": 1.0 - ess / n,
             "max_weight": float(max(weights)),
             "min_weight": float(min(weights)),
             "weight_std": float(np.std(np.asarray(weights, dtype=np.float64))),
@@ -136,87 +153,65 @@ def event_records(run_json, use_actual):
     return out
 
 
-def frame_gap_table(shadow_pose, weighted_pose):
-    common = sorted(set(shadow_pose) & set(weighted_pose))
+def frame_gap_table(shadow, weighted):
     rows = []
-    for f in common:
-        s, w = shadow_pose[f], weighted_pose[f]
-        row = {"frame": f}
-        for key in [
-            "pose_center_error_m",
-            "pose_log_translation_error_m",
-            "pose_rotation_error_rad",
-            "rgb_abs_median",
-            "depth_abs_median_m",
-        ]:
-            if key in s and key in w:
-                row[f"shadow_{key}"] = s[key]
-                row[f"weighted_{key}"] = w[key]
-                row[f"delta_{key}"] = w[key] - s[key]
-        rows.append(row)
+    for f in sorted(set(shadow) & set(weighted)):
+        s, w = shadow[f], weighted[f]
+        rows.append({
+            "frame": f,
+            "shadow_center_error_m": s["pose_center_error_m"],
+            "weighted_center_error_m": w["pose_center_error_m"],
+            "delta_center_error_m": w["pose_center_error_m"] - s["pose_center_error_m"],
+            "shadow_rotation_error_rad": s["pose_rotation_error_rad"],
+            "weighted_rotation_error_rad": w["pose_rotation_error_rad"],
+            "delta_rotation_error_rad": w["pose_rotation_error_rad"] - s["pose_rotation_error_rad"],
+        })
     return rows
 
 
-def nearest_exact(gap_by_frame, frame, key):
-    row = gap_by_frame.get(frame)
-    if row is None or key not in row or not finite(row[key]):
-        return None
-    return float(row[key])
-
-
-def lag_audit(events, gap_rows, horizons, delta_key):
-    """Correlate treatment intensity at k with future change in error gap.
-
-    future_change_h = delta_error(k+h) - delta_error(k). Using a change rather
-    than only the future level reduces the trivial correlation caused by an
-    already-diverged trajectory.
-    """
-    gap = {r["frame"]: r for r in gap_rows}
+def lag_audit(events, gap_rows, horizons, key):
+    by_frame = {r["frame"]: r for r in gap_rows}
     result = {}
     for h in horizons:
-        conc, ess_vals, maxw, future_change, future_level = [], [], [], [], []
+        conc, ess, maxw, changes, levels = [], [], [], [], []
         for e in events:
             k = e["current_frame"]
-            now = nearest_exact(gap, k, delta_key)
-            fut = nearest_exact(gap, k + h, delta_key)
-            if now is None or fut is None:
+            if k not in by_frame or k + h not in by_frame:
+                continue
+            now, future = by_frame[k][key], by_frame[k + h][key]
+            if not finite(now) or not finite(future):
                 continue
             conc.append(e["concentration"])
-            ess_vals.append(e["ess"])
+            ess.append(e["ess"])
             maxw.append(e["max_weight"])
-            future_change.append(fut - now)
-            future_level.append(fut)
-        rho_c_change, n = spearman(conc, future_change)
-        rho_ess_change, _ = spearman(ess_vals, future_change)
-        rho_maxw_change, _ = spearman(maxw, future_change)
-        rho_c_level, _ = spearman(conc, future_level)
+            changes.append(float(future - now))
+            levels.append(float(future))
+        rc, n = spearman(conc, changes)
+        re, _ = spearman(ess, changes)
+        rw, _ = spearman(maxw, changes)
+        rl, _ = spearman(conc, levels)
         result[str(h)] = {
             "n_mapping_calls": n,
-            "spearman_concentration_vs_future_gap_change": rho_c_change,
-            "spearman_ess_vs_future_gap_change": rho_ess_change,
-            "spearman_max_weight_vs_future_gap_change": rho_maxw_change,
-            "spearman_concentration_vs_future_gap_level": rho_c_level,
+            "spearman_concentration_vs_future_gap_change": rc,
+            "spearman_ess_vs_future_gap_change": re,
+            "spearman_max_weight_vs_future_gap_change": rw,
+            "spearman_concentration_vs_future_gap_level": rl,
+            "future_gap_change": quantiles(changes),
         }
     return result
 
 
-def rolling_dose_audit(events, gap_rows, history_frames, delta_key):
-    """Associate recent cumulative mapping concentration with current error gap."""
+def rolling_dose(events, gap_rows, histories, key):
     result = {}
-    for h in history_frames:
-        doses, gaps, frames = [], [], []
+    for h in histories:
+        doses, gaps = [], []
         for row in gap_rows:
             f = row["frame"]
-            if delta_key not in row or not finite(row[delta_key]):
-                continue
             recent = [e for e in events if f - h < e["current_frame"] <= f]
-            if not recent:
+            if not recent or not finite(row[key]):
                 continue
-            # Mean per optimization call intentionally preserves repeated mapping calls.
-            dose = float(np.mean([e["concentration"] for e in recent]))
-            doses.append(dose)
-            gaps.append(float(row[delta_key]))
-            frames.append(f)
+            doses.append(float(np.mean([e["concentration"] for e in recent])))
+            gaps.append(float(row[key]))
         rho, n = spearman(doses, gaps)
         result[str(h)] = {
             "n_frames": n,
@@ -226,19 +221,13 @@ def rolling_dose_audit(events, gap_rows, history_frames, delta_key):
     return result
 
 
-def strongest_gap_windows(gap_rows, width, delta_key, top_k=5):
-    """Descriptive localization of contiguous frame windows with largest mean gap."""
-    usable = {r["frame"]: float(r[delta_key]) for r in gap_rows if delta_key in r and finite(r[delta_key])}
-    if not usable:
-        return []
-    frames = sorted(usable)
+def strongest_gap_windows(rows, width, key, top_k=5):
+    vals = {r["frame"]: float(r[key]) for r in rows if finite(r[key])}
     candidates = []
-    for start in frames:
-        vals = [usable[f] for f in range(start, start + width) if f in usable]
-        if len(vals) < max(3, int(0.8 * width)):
-            continue
-        candidates.append((float(np.mean(vals)), start, start + width - 1, len(vals)))
-    # Greedy non-overlap keeps the report readable and avoids five near-identical windows.
+    for start in sorted(vals):
+        x = [vals[f] for f in range(start, start + width) if f in vals]
+        if len(x) >= max(3, int(.8 * width)):
+            candidates.append((float(np.mean(x)), start, start + width - 1, len(x)))
     selected = []
     for mean_gap, start, end, n in sorted(candidates, reverse=True):
         if any(not (end < s[1] or start > s[2]) for s in selected):
@@ -246,32 +235,29 @@ def strongest_gap_windows(gap_rows, width, delta_key, top_k=5):
         selected.append((mean_gap, start, end, n))
         if len(selected) == top_k:
             break
-    return [
-        {"start_frame": s, "end_frame": e, "n_frames": n, "mean_gap": g}
-        for g, s, e, n in selected
-    ]
+    return [{"start_frame": s, "end_frame": e, "n_frames": n, "mean_gap": g}
+            for g, s, e, n in selected]
 
 
-def annotate_gap_rows(gap_rows, weighted_events, history_frames):
-    for row in gap_rows:
+def annotate(rows, events, histories):
+    for row in rows:
         f = row["frame"]
-        for h in history_frames:
-            recent = [e for e in weighted_events if f - h < e["current_frame"] <= f]
+        for h in histories:
+            recent = [e for e in events if f - h < e["current_frame"] <= f]
             if recent:
                 row[f"recent_{h}f_mean_concentration"] = float(np.mean([e["concentration"] for e in recent]))
                 row[f"recent_{h}f_min_ess"] = float(min(e["ess"] for e in recent))
                 row[f"recent_{h}f_max_weight"] = float(max(e["max_weight"] for e in recent))
                 row[f"recent_{h}f_mapping_calls"] = len(recent)
-    return gap_rows
+    return rows
 
 
 def write_csv(path, rows):
-    keys = []
-    seen = set()
-    for row in rows:
-        for key in row:
-            if key not in seen:
-                seen.add(key); keys.append(key)
+    keys, seen = [], set()
+    for r in rows:
+        for k in r:
+            if k not in seen:
+                seen.add(k); keys.append(k)
     with path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=keys)
         w.writeheader(); w.writerows(rows)
@@ -280,109 +266,105 @@ def write_csv(path, rows):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--audit-json", type=Path, required=True)
-    p.add_argument("--audit-csv", type=Path, required=True)
+    # Kept only so the previous command line remains accepted; full trajectories
+    # are now loaded directly from the m2a_dir recorded in audit-json.
+    p.add_argument("--audit-csv", type=Path, default=None)
     p.add_argument("--shadow-name", default="shadow")
     p.add_argument("--weighted-name", default="weighted")
     p.add_argument("--horizons", type=int, nargs="+", default=[5, 10, 20, 40])
     p.add_argument("--history-frames", type=int, nargs="+", default=[10, 20, 40])
     p.add_argument("--gap-window", type=int, default=20)
-    p.add_argument("--output", type=Path, default=Path("results/box1_temporal_audit.json"))
+    p.add_argument("--output", type=Path, default=Path("results/box1_temporal_audit_full.json"))
     args = p.parse_args()
 
     with args.audit_json.open() as f:
         audit = json.load(f)
     for name in (args.shadow_name, args.weighted_name):
         if name not in audit.get("runs", {}):
-            raise KeyError(f"Run {name!r} not found in {args.audit_json}")
+            raise KeyError(f"Run {name!r} missing from {args.audit_json}")
 
-    shadow_pose = load_unique_pose_rows(args.audit_csv, args.shadow_name)
-    weighted_pose = load_unique_pose_rows(args.audit_csv, args.weighted_name)
+    sr = audit["runs"][args.shadow_name]
+    wr = audit["runs"][args.weighted_name]
+    shadow_pose, A_s, n_s = load_full_pose_trajectory(sr["m2a_dir"])
+    weighted_pose, A_w, n_w = load_full_pose_trajectory(wr["m2a_dir"])
     gaps = frame_gap_table(shadow_pose, weighted_pose)
-    if len(gaps) < 10:
-        raise RuntimeError(f"Only {len(gaps)} common pose frames; temporal audit is not meaningful")
+    if len(gaps) < 100:
+        raise RuntimeError(
+            f"Only {len(gaps)} common full-pose frames. Expected dense per-frame M2-A diagnostics; "
+            "do not interpret a sparse temporal audit."
+        )
 
-    shadow_events = event_records(audit["runs"][args.shadow_name], use_actual=True)
-    weighted_events = event_records(audit["runs"][args.weighted_name], use_actual=True)
+    shadow_events, weighted_events = event_records(sr), event_records(wr)
+    if any(abs(e["ess"] - e["window_size"]) > 1e-6 for e in shadow_events):
+        raise RuntimeError("Shadow actual weights are not neutral")
     if not weighted_events:
         raise RuntimeError("No weighted mapping events")
 
-    # Shadow diagnostic must truly be behavior-neutral at the loss weighting site.
-    shadow_actual = [e["ess"] for e in shadow_events]
-    shadow_sizes = [e["window_size"] for e in shadow_events]
-    if any(abs(a - b) > 1e-6 for a, b in zip(shadow_actual, shadow_sizes)):
-        raise RuntimeError("Shadow actual ESS is not equal to window size; shadow is not neutral")
-
-    delta_center = "delta_pose_center_error_m"
-    delta_rot = "delta_pose_rotation_error_rad"
-    gaps = annotate_gap_rows(gaps, weighted_events, args.history_frames)
-
+    gaps = annotate(gaps, weighted_events, args.history_frames)
+    center_key, rot_key = "delta_center_error_m", "delta_rotation_error_rad"
     report = {
-        "method": "m1_mapping_temporal_concentration_divergence_audit",
+        "method": "m1_mapping_temporal_concentration_divergence_audit_full_pose",
         "source_json": str(args.audit_json),
-        "source_csv": str(args.audit_csv),
-        "shadow_name": args.shadow_name,
-        "weighted_name": args.weighted_name,
-        "common_pose_frames": len(gaps),
-        "weighted_mapping_calls": len(weighted_events),
+        "shadow_m2a_dir": sr["m2a_dir"], "weighted_m2a_dir": wr["m2a_dir"],
+        "shadow_pose_frames": n_s, "weighted_pose_frames": n_w,
+        "common_pose_frames": len(gaps), "weighted_mapping_calls": len(weighted_events),
+        "alignment_shadow": A_s, "alignment_weighted": A_w,
         "guardrail": (
-            "Descriptive temporal audit only. Runs are independently gauge-aligned; "
-            "mapping calls overlap and are not independent. Positive lag association "
-            "is consistent with, but does not prove, a causal concentration->divergence mechanism."
+            "Descriptive temporal audit. Each trajectory is independently no-scale SE(3) gauge-aligned "
+            "to GT over its full saved trajectory. Mapping calls overlap and are dependent; association "
+            "and temporal precedence do not establish causality."
         ),
         "weighted_actual_concentration": {
             "ess": quantiles([e["ess"] for e in weighted_events]),
-            "concentration_1_minus_ess_over_n": quantiles([e["concentration"] for e in weighted_events]),
+            "concentration": quantiles([e["concentration"] for e in weighted_events]),
             "max_weight": quantiles([e["max_weight"] for e in weighted_events]),
         },
         "trajectory_gap": {
-            "center_error_gap_m_weighted_minus_shadow": quantiles([
-                r[delta_center] for r in gaps if delta_center in r
-            ]),
-            "rotation_error_gap_rad_weighted_minus_shadow": quantiles([
-                r[delta_rot] for r in gaps if delta_rot in r
-            ]),
+            "center_error_gap_m_weighted_minus_shadow": quantiles([r[center_key] for r in gaps]),
+            "rotation_error_gap_rad_weighted_minus_shadow": quantiles([r[rot_key] for r in gaps]),
         },
-        "lag_audit_center_error": lag_audit(weighted_events, gaps, args.horizons, delta_center),
-        "lag_audit_rotation_error": lag_audit(weighted_events, gaps, args.horizons, delta_rot),
-        "rolling_dose_center_error": rolling_dose_audit(weighted_events, gaps, args.history_frames, delta_center),
-        "rolling_dose_rotation_error": rolling_dose_audit(weighted_events, gaps, args.history_frames, delta_rot),
-        "largest_center_gap_windows": strongest_gap_windows(gaps, args.gap_window, delta_center),
+        "lag_center": lag_audit(weighted_events, gaps, args.horizons, center_key),
+        "lag_rotation": lag_audit(weighted_events, gaps, args.horizons, rot_key),
+        "rolling_center": rolling_dose(weighted_events, gaps, args.history_frames, center_key),
+        "rolling_rotation": rolling_dose(weighted_events, gaps, args.history_frames, rot_key),
+        "largest_center_gap_windows": strongest_gap_windows(gaps, args.gap_window, center_key),
     }
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    timeline_csv = args.output.with_suffix(".csv")
+    timeline = args.output.with_suffix(".csv")
     with args.output.open("w") as f:
         json.dump(report, f, indent=2, allow_nan=True)
-    write_csv(timeline_csv, gaps)
+    write_csv(timeline, gaps)
 
-    print("=" * 92)
-    print("M1 mapping temporal concentration-divergence audit")
-    print("=" * 92)
-    print(f"common pose frames={len(gaps)}  weighted mapping calls={len(weighted_events)}")
+    print("=" * 94)
+    print("M1 mapping temporal concentration-divergence audit — FULL per-frame pose")
+    print("=" * 94)
+    print(f"pose frames shadow/weighted/common={n_s}/{n_w}/{len(gaps)}  weighted mapping calls={len(weighted_events)}")
     s = report["weighted_actual_concentration"]["ess"]
     print(f"weighted ACTUAL ESS q05/median/q95: {s['q05']:.3f} / {s['median']:.3f} / {s['q95']:.3f}")
     s = report["trajectory_gap"]["center_error_gap_m_weighted_minus_shadow"]
     print(f"center-error gap W-S [m] q05/median/q95: {s['q05']:.5f} / {s['median']:.5f} / {s['q95']:.5f}")
 
-    print("\nLag audit: concentration at mapping frame k vs future CENTER-error gap change")
-    print("  horizon   n    rho(conc, future_change)   rho(ESS, future_change)   rho(max_w, future_change)")
+    print("\nLag audit: concentration at mapping frame k vs FUTURE CENTER-gap change")
+    print(" horizon    n    rho(conc,change)   rho(ESS,change)   rho(max_w,change)   rho(conc,future_level)")
     for h in args.horizons:
-        x = report["lag_audit_center_error"][str(h)]
-        print(f"  {h:>7d} {x['n_mapping_calls']:>4d} {x['spearman_concentration_vs_future_gap_change']:>26.3f} "
-              f"{x['spearman_ess_vs_future_gap_change']:>25.3f} {x['spearman_max_weight_vs_future_gap_change']:>27.3f}")
+        x = report["lag_center"][str(h)]
+        print(f" {h:>7d} {x['n_mapping_calls']:>4d} {x['spearman_concentration_vs_future_gap_change']:>18.3f} "
+              f"{x['spearman_ess_vs_future_gap_change']:>17.3f} {x['spearman_max_weight_vs_future_gap_change']:>20.3f} "
+              f"{x['spearman_concentration_vs_future_gap_level']:>24.3f}")
 
     print("\nRolling dose: recent concentration vs current CENTER-error gap")
-    print("  history   n    rho")
+    print(" history    n       rho")
     for h in args.history_frames:
-        x = report["rolling_dose_center_error"][str(h)]
-        print(f"  {h:>7d} {x['n_frames']:>4d} {x['spearman_recent_concentration_vs_current_gap']:>7.3f}")
+        x = report["rolling_center"][str(h)]
+        print(f" {h:>7d} {x['n_frames']:>4d} {x['spearman_recent_concentration_vs_current_gap']:>9.3f}")
 
-    print(f"\nLargest {args.gap_window}-frame mean center-error-gap windows:")
+    print(f"\nLargest non-overlapping {args.gap_window}-frame mean center-gap windows:")
     for x in report["largest_center_gap_windows"]:
-        print(f"  frames {x['start_frame']:>4d}-{x['end_frame']:<4d}  mean gap={x['mean_gap']:.5f} m  n={x['n_frames']}")
+        print(f" frames {x['start_frame']:>4d}-{x['end_frame']:<4d} mean gap={x['mean_gap']:.5f} m n={x['n_frames']}")
 
     print(f"\nSaved JSON: {args.output}")
-    print(f"Saved timeline CSV: {timeline_csv}")
+    print(f"Saved timeline CSV: {timeline}")
 
 
 if __name__ == "__main__":
