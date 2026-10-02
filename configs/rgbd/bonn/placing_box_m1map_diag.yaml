@@ -1,0 +1,6 @@
+# Box1 failure-mechanism audit: weighted intervention with every mapping
+# window logged. Method parameters are unchanged from placing_box_m1map.yaml.
+inherit_from: "configs/rgbd/bonn/placing_box_m1map.yaml"
+
+Uncertainty:
+  m1_mapping_log_every: 1
