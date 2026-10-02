@@ -1,0 +1,18 @@
+# Diagnostic-only M1 -> motion-segmentation uncertainty propagation.
+# No SLAM state, motion mask, loss, keyframe decision, or Gaussian update is changed.
+inherit_from: "configs/rgbd/bonn/config.yaml"
+
+Dataset:
+  dataset_path: "datasets/bonn/rgbd_bonn_placing_nonobstructing_box3"
+
+Training:
+  single_thread: true
+  dystart: 348
+
+Uncertainty:
+  m1_mapping_weighting: false
+  m1_motion_shadow_audit: true
+  m1_motion_signal_file: results/m1_mapping_signal_bonn_loso.json
+  m1_motion_signal_fold: placing_box3
+  m1_motion_eig_floor_rel: 1.0e-10
+  m1_motion_hist_bins: 64
