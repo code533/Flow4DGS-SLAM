@@ -1,0 +1,11 @@
+# Box1 failure-mechanism audit: execute the identical M1 mapping-signal path,
+# but force every applied RGB-D weight to exactly 1.0. This is a diagnostic
+# shadow, not a new method setting. The offline audit reconstructs the original
+# [0.25, 4.0] candidate weights from saved M1 covariance.
+inherit_from: "configs/rgbd/bonn/placing_box_m1map.yaml"
+
+Uncertainty:
+  m1_mapping_weighting: true
+  m1_mapping_clip_min: 1.0
+  m1_mapping_clip_max: 1.0
+  m1_mapping_log_every: 1
