@@ -1,0 +1,23 @@
+# Diagnostic-only spatial cross-fit of M1 motion uncertainty.
+# No motion mask, pose, loss, keyframe decision, or Gaussian state is changed.
+inherit_from: "configs/rgbd/bonn/config.yaml"
+
+Dataset:
+  dataset_path: "datasets/bonn/rgbd_bonn_placing_nonobstructing_box"
+
+Training:
+  single_thread: true
+  dystart: 241
+
+Uncertainty:
+  m1_mapping_weighting: false
+  m1_motion_shadow_audit: false
+  m1_motion_crossfit_audit: true
+  m1_motion_signal_file: results/m1_mapping_signal_bonn_loso.json
+  m1_motion_signal_fold: placing_box
+  m1_motion_eig_floor_rel: 1.0e-10
+
+  # First sanity pass only. Four quadrant fits are substantially more
+  # expensive than the ordinary shadow covariance, so test the transition
+  # neighborhood before expanding to the full sequence.
+  m1_motion_crossfit_frame_range: [211, 271]
