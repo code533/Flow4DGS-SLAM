@@ -6,9 +6,17 @@ outside the held-out quadrant, then residual statistics are evaluated only on
 the held-out quadrant. This removes direct pixel reuse between the M1 fit and
 its evaluation set.
 
-The existing LOSO covariance calibration is also reported as a sensitivity
-view, but it was not trained specifically for the cross-fitted estimator and
-must not be interpreted as an absolutely calibrated chi-square model.
+The existing LOSO covariance calibration is a sensitivity view: it was not
+trained specifically for the cross-fitted estimator and must not be interpreted
+as an absolutely calibrated chi-square model.
+
+V2 additionally decomposes the projected 2x2 pose covariance into scale and
+shape controls without any additional M1 fits:
+  * LOSO full: calibrated scale + calibrated shape.
+  * LOSO-shape/raw-scale: calibrated 2D covariance shape, raw projected trace.
+  * raw-shape/LOSO-scale: raw 2D covariance shape, calibrated projected trace.
+  * LOSO-scale/isotropic: calibrated projected trace, isotropic 2D shape.
+These are diagnostic ablations only and never change runtime SLAM state.
 """
 
 from pathlib import Path
@@ -58,7 +66,9 @@ def _auc_static_dynamic(static_scores, dynamic_scores):
     if n0 == 0 or n1 == 0:
         return float("nan")
     scores = torch.cat([s, d])
-    labels = torch.cat([torch.zeros(n0, dtype=torch.float64), torch.ones(n1, dtype=torch.float64)])
+    labels = torch.cat(
+        [torch.zeros(n0, dtype=torch.float64), torch.ones(n1, dtype=torch.float64)]
+    )
     order = torch.argsort(scores)
     xs = scores[order]
     ys = labels[order]
@@ -72,16 +82,40 @@ def _auc_static_dynamic(static_scores, dynamic_scores):
     return float(wins / float(n0 * n1))
 
 
-def _group_stats(mask, residual_norm, d2_obs, d2_raw, d2_cal, pose_raw_ratio, pose_cal_ratio):
-    return {
+def _pose_maha(residual, r00, r01, r11, pose):
+    return _maha2(
+        residual,
+        r00 + pose[..., 0, 0],
+        r01 + pose[..., 0, 1],
+        r11 + pose[..., 1, 1],
+    )
+
+
+def _scale_cov_to_trace(cov, target_trace):
+    """Preserve each 2x2 covariance shape while matching a target trace."""
+    trace = (cov[..., 0, 0] + cov[..., 1, 1]).clamp_min(1.0e-20)
+    factor = target_trace.clamp_min(0) / trace
+    return cov * factor[..., None, None]
+
+
+def _isotropic_cov_from_trace(trace):
+    """2x2 isotropic PSD covariance with the requested trace."""
+    out = torch.zeros((*trace.shape, 2, 2), device=trace.device, dtype=trace.dtype)
+    half = 0.5 * trace.clamp_min(0)
+    out[..., 0, 0] = half
+    out[..., 1, 1] = half
+    return out
+
+
+def _group_stats(mask, scores, pose_raw_ratio, pose_cal_ratio):
+    out = {
         "n": int(mask.sum().detach().cpu()),
-        "raw_resid_px": _quantiles(residual_norm[mask]),
-        "d2_observation_only": _quantiles(d2_obs[mask]),
-        "d2_predictive_raw": _quantiles(d2_raw[mask]),
-        "d2_predictive_loso_sensitivity": _quantiles(d2_cal[mask]),
         "pose_raw_to_observation_trace_ratio": _quantiles(pose_raw_ratio[mask]),
         "pose_loso_to_observation_trace_ratio": _quantiles(pose_cal_ratio[mask]),
     }
+    for name, values in scores.items():
+        out[name] = _quantiles(values[mask])
+    return out
 
 
 class M1MotionCrossfitAudit:
@@ -133,11 +167,23 @@ class M1MotionCrossfitAudit:
             & initial_static_mask.bool()
         )
 
+        score_names = (
+            "raw_resid_px",
+            "d2_observation_only",
+            "d2_predictive_raw",
+            "d2_predictive_loso_sensitivity",
+            "d2_ablate_loso_shape_raw_scale",
+            "d2_ablate_raw_shape_loso_scale",
+            "d2_ablate_loso_scale_isotropic",
+        )
         folds = []
         pooled = {
-            "static": {"raw": [], "obs": [], "pred_raw": [], "pred_cal": [], "ratio_raw": [], "ratio_cal": []},
-            "dynamic": {"raw": [], "obs": [], "pred_raw": [], "pred_cal": [], "ratio_raw": [], "ratio_cal": []},
+            "static": {name: [] for name in score_names},
+            "dynamic": {name: [] for name in score_names},
         }
+        for name in ("static", "dynamic"):
+            pooled[name]["ratio_raw"] = []
+            pooled[name]["ratio_cal"] = []
 
         for fold_idx, holdout in enumerate(quadrants):
             train_mask = static_fit_mask.bool() & (~holdout)
@@ -174,26 +220,80 @@ class M1MotionCrossfitAudit:
 
             pose_raw = torch.einsum("hwai,ij,hwbj->hwab", L, P_raw, L)
             pose_cal = torch.einsum("hwai,ij,hwbj->hwab", L, P_cal, L)
+            trace_raw = (pose_raw[..., 0, 0] + pose_raw[..., 1, 1]).clamp_min(0)
+            trace_cal = (pose_cal[..., 0, 0] + pose_cal[..., 1, 1]).clamp_min(0)
+
+            # Scale/shape decomposition in projected 2D flow-covariance space.
+            # These controls require no extra probabilistic fits.
+            pose_loso_shape_raw_scale = _scale_cov_to_trace(pose_cal, trace_raw)
+            pose_raw_shape_loso_scale = _scale_cov_to_trace(pose_raw, trace_cal)
+            pose_loso_scale_isotropic = _isotropic_cov_from_trace(trace_cal)
 
             d2_obs = _maha2(residual, r00, r01, r11)
-            d2_raw = _maha2(
-                residual,
-                r00 + pose_raw[..., 0, 0],
-                r01 + pose_raw[..., 0, 1],
-                r11 + pose_raw[..., 1, 1],
-            )
-            d2_cal = _maha2(
-                residual,
-                r00 + pose_cal[..., 0, 0],
-                r01 + pose_cal[..., 0, 1],
-                r11 + pose_cal[..., 1, 1],
-            )
-            ratio_raw = (pose_raw[..., 0, 0] + pose_raw[..., 1, 1]).clamp_min(0) / trace_obs
-            ratio_cal = (pose_cal[..., 0, 0] + pose_cal[..., 1, 1]).clamp_min(0) / trace_obs
+            scores = {
+                "raw_resid_px": residual_norm,
+                "d2_observation_only": d2_obs,
+                "d2_predictive_raw": _pose_maha(residual, r00, r01, r11, pose_raw),
+                "d2_predictive_loso_sensitivity": _pose_maha(residual, r00, r01, r11, pose_cal),
+                "d2_ablate_loso_shape_raw_scale": _pose_maha(
+                    residual, r00, r01, r11, pose_loso_shape_raw_scale
+                ),
+                "d2_ablate_raw_shape_loso_scale": _pose_maha(
+                    residual, r00, r01, r11, pose_raw_shape_loso_scale
+                ),
+                "d2_ablate_loso_scale_isotropic": _pose_maha(
+                    residual, r00, r01, r11, pose_loso_scale_isotropic
+                ),
+            }
+            ratio_raw = trace_raw / trace_obs
+            ratio_cal = trace_cal / trace_obs
 
             eval_mask = base_eval_valid & holdout
             dyn = baseline_dynamic_mask.bool() & eval_mask
             sta = (~baseline_dynamic_mask.bool()) & eval_mask
+
+            invariant_keys = {
+                "raw_pred_gt_obs_fraction": "d2_predictive_raw",
+                "loso_pred_gt_obs_fraction": "d2_predictive_loso_sensitivity",
+                "loso_shape_raw_scale_pred_gt_obs_fraction": "d2_ablate_loso_shape_raw_scale",
+                "raw_shape_loso_scale_pred_gt_obs_fraction": "d2_ablate_raw_shape_loso_scale",
+                "loso_scale_isotropic_pred_gt_obs_fraction": "d2_ablate_loso_scale_isotropic",
+            }
+            invariants = {}
+            for key, score_name in invariant_keys.items():
+                invariants[key] = (
+                    float(
+                        (
+                            scores[score_name]
+                            > d2_obs * (1.0 + 1.0e-5) + 1.0e-6
+                        )[eval_mask]
+                        .float()
+                        .mean()
+                        .detach()
+                        .cpu()
+                    )
+                    if bool(eval_mask.any())
+                    else float("nan")
+                )
+
+            # Verify the intended trace matching numerically on the held-out region.
+            def trace_relerr(cov, target):
+                tr = cov[..., 0, 0] + cov[..., 1, 1]
+                den = target.abs().clamp_min(1.0e-12)
+                return float(((tr - target).abs() / den)[eval_mask].max().detach().cpu()) \
+                    if bool(eval_mask.any()) else float("nan")
+
+            invariants.update({
+                "loso_shape_raw_scale_trace_relerr_max": trace_relerr(
+                    pose_loso_shape_raw_scale, trace_raw
+                ),
+                "raw_shape_loso_scale_trace_relerr_max": trace_relerr(
+                    pose_raw_shape_loso_scale, trace_cal
+                ),
+                "loso_scale_isotropic_trace_relerr_max": trace_relerr(
+                    pose_loso_scale_isotropic, trace_cal
+                ),
+            })
 
             folds.append({
                 "fold": int(fold_idx),
@@ -205,24 +305,15 @@ class M1MotionCrossfitAudit:
                 "covariance_mode": str(result.get("covariance_mode")),
                 "cluster_count": int(result.get("cluster_counts", {}).get(self.block_size, 0)),
                 "groups": {
-                    "baseline_static": _group_stats(sta, residual_norm, d2_obs, d2_raw, d2_cal, ratio_raw, ratio_cal),
-                    "baseline_dynamic": _group_stats(dyn, residual_norm, d2_obs, d2_raw, d2_cal, ratio_raw, ratio_cal),
+                    "baseline_static": _group_stats(sta, scores, ratio_raw, ratio_cal),
+                    "baseline_dynamic": _group_stats(dyn, scores, ratio_raw, ratio_cal),
                 },
-                "invariants": {
-                    "raw_pred_gt_obs_fraction": float(
-                        ((d2_raw > d2_obs * (1.0 + 1.0e-5) + 1.0e-6)[eval_mask]).float().mean().detach().cpu()
-                    ) if bool(eval_mask.any()) else float("nan"),
-                    "loso_pred_gt_obs_fraction": float(
-                        ((d2_cal > d2_obs * (1.0 + 1.0e-5) + 1.0e-6)[eval_mask]).float().mean().detach().cpu()
-                    ) if bool(eval_mask.any()) else float("nan"),
-                },
+                "invariants": invariants,
             })
 
             for name, mask in (("static", sta), ("dynamic", dyn)):
-                pooled[name]["raw"].append(residual_norm[mask].detach().cpu())
-                pooled[name]["obs"].append(d2_obs[mask].detach().cpu())
-                pooled[name]["pred_raw"].append(d2_raw[mask].detach().cpu())
-                pooled[name]["pred_cal"].append(d2_cal[mask].detach().cpu())
+                for score_name in score_names:
+                    pooled[name][score_name].append(scores[score_name][mask].detach().cpu())
                 pooled[name]["ratio_raw"].append(ratio_raw[mask].detach().cpu())
                 pooled[name]["ratio_cal"].append(ratio_cal[mask].detach().cpu())
 
@@ -232,28 +323,22 @@ class M1MotionCrossfitAudit:
 
         pooled_groups = {}
         for name in ("static", "dynamic"):
-            vals = {k: cat(name, k) for k in pooled[name]}
             pooled_groups["baseline_" + name] = {
-                "n": int(vals["obs"].numel()),
-                "raw_resid_px": _quantiles(vals["raw"]),
-                "d2_observation_only": _quantiles(vals["obs"]),
-                "d2_predictive_raw": _quantiles(vals["pred_raw"]),
-                "d2_predictive_loso_sensitivity": _quantiles(vals["pred_cal"]),
-                "pose_raw_to_observation_trace_ratio": _quantiles(vals["ratio_raw"]),
-                "pose_loso_to_observation_trace_ratio": _quantiles(vals["ratio_cal"]),
+                "n": int(cat(name, "d2_observation_only").numel()),
+                **{score_name: _quantiles(cat(name, score_name)) for score_name in score_names},
+                "pose_raw_to_observation_trace_ratio": _quantiles(cat(name, "ratio_raw")),
+                "pose_loso_to_observation_trace_ratio": _quantiles(cat(name, "ratio_cal")),
             }
 
-        static_vals = {k: cat("static", k) for k in pooled["static"]}
-        dynamic_vals = {k: cat("dynamic", k) for k in pooled["dynamic"]}
         auc = {
-            "raw_resid_px": _auc_static_dynamic(static_vals["raw"], dynamic_vals["raw"]),
-            "d2_observation_only": _auc_static_dynamic(static_vals["obs"], dynamic_vals["obs"]),
-            "d2_predictive_raw": _auc_static_dynamic(static_vals["pred_raw"], dynamic_vals["pred_raw"]),
-            "d2_predictive_loso_sensitivity": _auc_static_dynamic(static_vals["pred_cal"], dynamic_vals["pred_cal"]),
+            score_name: _auc_static_dynamic(
+                cat("static", score_name), cat("dynamic", score_name)
+            )
+            for score_name in score_names
         }
 
         payload = {
-            "method": "m1_motion_spatial_crossfit_shadow_v1",
+            "method": "m1_motion_spatial_crossfit_shadow_v2_scale_shape",
             "frame": int(frame),
             "dystart": None if dystart is None else int(dystart),
             "fold": self.fold,
@@ -263,6 +348,8 @@ class M1MotionCrossfitAudit:
                 "training_uses_baseline_static_only": True,
                 "evaluation_is_held_out_spatial_region": True,
                 "loso_calibration_is_sensitivity_only": True,
+                "ablation_space": "projected_2d_flow_covariance",
+                "ablation_requires_extra_fits": False,
             },
             "block_size": self.block_size,
             "folds": folds,
