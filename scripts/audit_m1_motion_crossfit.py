@@ -3,7 +3,8 @@
 
 No intervention threshold is selected. LOSO-calibrated covariance is reported
 only as a sensitivity analysis because the calibration was not trained for the
-cross-fitted estimator.
+cross-fitted estimator. V2 additionally reports projected 2D covariance
+scale/shape ablations computed from the same cross-fit, with no extra M1 fits.
 """
 
 import argparse
@@ -12,6 +13,19 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+
+BASE_METRICS = (
+    "raw_resid_px",
+    "d2_observation_only",
+    "d2_predictive_raw",
+    "d2_predictive_loso_sensitivity",
+)
+ABLATION_METRICS = (
+    "d2_ablate_loso_shape_raw_scale",
+    "d2_ablate_raw_shape_loso_scale",
+    "d2_ablate_loso_scale_isotropic",
+)
 
 
 def load(path):
@@ -38,16 +52,19 @@ def mean(values):
 
 def summarize(payloads):
     ps = sorted(payloads, key=lambda p: int(p["frame"]))
-    valid = [p for p in ps if p.get("method") == "m1_motion_spatial_crossfit_shadow_v1"]
+    valid_methods = {
+        "m1_motion_spatial_crossfit_shadow_v1",
+        "m1_motion_spatial_crossfit_shadow_v2_scale_shape",
+    }
+    valid = [p for p in ps if p.get("method") in valid_methods]
     if not valid:
-        raise ValueError("No valid m1_motion_spatial_crossfit_shadow_v1 payloads")
+        raise ValueError("No valid M1 spatial cross-fit payloads")
 
-    metrics = (
-        "raw_resid_px",
-        "d2_observation_only",
-        "d2_predictive_raw",
-        "d2_predictive_loso_sensitivity",
+    has_ablation = all(
+        all(m in p.get("auc_dynamic_vs_static", {}) for m in ABLATION_METRICS)
+        for p in valid
     )
+    metrics = BASE_METRICS + ABLATION_METRICS if has_ablation else BASE_METRICS
     auc = {m: med(p["auc_dynamic_vs_static"].get(m, np.nan) for p in valid) for m in metrics}
 
     def q50(group, metric):
@@ -57,6 +74,7 @@ def summarize(payloads):
         "n_frames": len(valid),
         "frame_min": int(valid[0]["frame"]),
         "frame_max": int(valid[-1]["frame"]),
+        "has_scale_shape_ablation": bool(has_ablation),
         "median_frame_auc": auc,
         "frame_median_q50": {},
         "mean_invariant_raw_pred_gt_obs": mean(
@@ -92,6 +110,29 @@ def summarize(payloads):
             "dynamic": q50("baseline_dynamic", metric),
         }
 
+    if has_ablation:
+        invariant_map = {
+            "mean_invariant_loso_shape_raw_scale_pred_gt_obs":
+                "loso_shape_raw_scale_pred_gt_obs_fraction",
+            "mean_invariant_raw_shape_loso_scale_pred_gt_obs":
+                "raw_shape_loso_scale_pred_gt_obs_fraction",
+            "mean_invariant_loso_scale_isotropic_pred_gt_obs":
+                "loso_scale_isotropic_pred_gt_obs_fraction",
+            "max_trace_relerr_loso_shape_raw_scale":
+                "loso_shape_raw_scale_trace_relerr_max",
+            "max_trace_relerr_raw_shape_loso_scale":
+                "raw_shape_loso_scale_trace_relerr_max",
+            "max_trace_relerr_loso_scale_isotropic":
+                "loso_scale_isotropic_trace_relerr_max",
+        }
+        for out_key, fold_key in invariant_map.items():
+            values = [
+                f["invariants"].get(fold_key, np.nan)
+                for p in valid for f in p["folds"]
+            ]
+            out[out_key] = max(finite(values), default=float("nan")) \
+                if out_key.startswith("max_") else mean(values)
+
     dystarts = [p.get("dystart") for p in valid if p.get("dystart") is not None]
     if dystarts:
         dystart = int(np.median(dystarts))
@@ -126,18 +167,34 @@ def print_summary(label, s):
     )
     print("median frame AUC dynamic>static:")
     for k, v in s["median_frame_auc"].items():
-        print(f"  {k:35s} {v:.4f}")
+        print(f"  {k:38s} {v:.4f}")
     print("frame-median q50 static / dynamic / ratio:")
     for k, v in s["frame_median_q50"].items():
         if "dynamic_over_static" in v:
-            print(f"  {k:35s} {v['static']:.5g} / {v['dynamic']:.5g} / {v['dynamic_over_static']:.3f}x")
+            print(
+                f"  {k:38s} {v['static']:.5g} / {v['dynamic']:.5g} / "
+                f"{v['dynamic_over_static']:.3f}x"
+            )
         else:
-            print(f"  {k:35s} {v['static']:.5g} / {v['dynamic']:.5g}")
+            print(f"  {k:38s} {v['static']:.5g} / {v['dynamic']:.5g}")
     print(
         "PSD invariant raw/LOSO pred_d2>obs_d2 mean fraction: "
         f"{s['mean_invariant_raw_pred_gt_obs']:.3e} / "
         f"{s['mean_invariant_loso_pred_gt_obs']:.3e}"
     )
+    if s.get("has_scale_shape_ablation"):
+        print(
+            "PSD invariant shapeRaw/rawShape/isotropic mean fraction: "
+            f"{s['mean_invariant_loso_shape_raw_scale_pred_gt_obs']:.3e} / "
+            f"{s['mean_invariant_raw_shape_loso_scale_pred_gt_obs']:.3e} / "
+            f"{s['mean_invariant_loso_scale_isotropic_pred_gt_obs']:.3e}"
+        )
+        print(
+            "trace-match max relative error shapeRaw/rawShape/isotropic: "
+            f"{s['max_trace_relerr_loso_shape_raw_scale']:.3e} / "
+            f"{s['max_trace_relerr_raw_shape_loso_scale']:.3e} / "
+            f"{s['max_trace_relerr_loso_scale_isotropic']:.3e}"
+        )
     if "dystart" in s:
         print(f"dystart={s['dystart']}")
         for radius in (10, 30):
@@ -146,9 +203,11 @@ def print_summary(label, s):
                 continue
             x = s[key]
             print(f"  +/-{radius} frames={x['n_frames']}")
-            for m in ("d2_observation_only", "d2_predictive_raw", "d2_predictive_loso_sensitivity"):
+            for m in s["median_frame_auc"]:
+                if m == "raw_resid_px":
+                    continue
                 print(
-                    f"    {m:33s} AUC={x['median_auc'][m]:.4f} "
+                    f"    {m:36s} AUC={x['median_auc'][m]:.4f} "
                     f"dyn/static={x['median_dynamic_over_static'][m]:.3f}x"
                 )
 
@@ -159,8 +218,11 @@ def main():
     ap.add_argument("--output", default=None)
     args = ap.parse_args()
     report = {
-        "method": "m1_motion_spatial_crossfit_audit_v1",
-        "note": "No intervention threshold selected; LOSO calibration is sensitivity-only for this estimator.",
+        "method": "m1_motion_spatial_crossfit_audit_v2_scale_shape",
+        "note": (
+            "No intervention threshold selected; LOSO calibration is sensitivity-only. "
+            "V2 scale/shape controls are formed in projected 2D flow-covariance space."
+        ),
         "runs": {},
     }
     for run in args.run_dirs:
