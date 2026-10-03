@@ -10,13 +10,17 @@ The existing LOSO covariance calibration is a sensitivity view: it was not
 trained specifically for the cross-fitted estimator and must not be interpreted
 as an absolutely calibrated chi-square model.
 
-V2 additionally decomposes the projected 2x2 pose covariance into scale and
-shape controls without any additional M1 fits:
-  * LOSO full: calibrated scale + calibrated shape.
-  * LOSO-shape/raw-scale: calibrated 2D covariance shape, raw projected trace.
-  * raw-shape/LOSO-scale: raw 2D covariance shape, calibrated projected trace.
-  * LOSO-scale/isotropic: calibrated projected trace, isotropic 2D shape.
-These are diagnostic ablations only and never change runtime SLAM state.
+V2 decomposes projected 2x2 pose covariance into scale and shape controls.
+V3 adds scale-source controls, all computed from the same cross-fit:
+  * full LOSO projected scale with isotropic 2D shape (existing V2 control);
+  * geometry-only scale from tr(L L^T), median-matched per held-out fold;
+  * constant scale equal to the held-out-fold median LOSO projected trace;
+  * deterministically shuffled LOSO projected scale within the held-out fold.
+
+V3 also records scalar associations for LOSO projected scale, interaction-matrix
+geometry, depth, and normalized image radius. No source control uses dynamic
+labels to set its scale, and the deterministic shuffle uses a local CPU RNG so
+it does not perturb the SLAM process RNG state.
 """
 
 from pathlib import Path
@@ -107,6 +111,33 @@ def _isotropic_cov_from_trace(trace):
     return out
 
 
+def _median_match(values, target, mask):
+    """Scale values so their masked median matches target's masked median."""
+    if not bool(mask.any()):
+        return values, float("nan")
+    src_med = torch.median(values[mask]).clamp_min(1.0e-20)
+    tgt_med = torch.median(target[mask]).clamp_min(0)
+    factor = tgt_med / src_med
+    return values * factor, float(factor.detach().cpu())
+
+
+def _shuffle_on_mask(values, mask, seed):
+    """Exact masked-value permutation using a local CPU RNG only."""
+    out = values.clone()
+    flat_mask = mask.reshape(-1)
+    idx = torch.nonzero(flat_mask, as_tuple=False).squeeze(1)
+    n = int(idx.numel())
+    if n <= 1:
+        return out
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(int(seed))
+    perm = torch.randperm(n, generator=gen).to(device=idx.device)
+    out_flat = out.reshape(-1)
+    src = values.reshape(-1)[idx]
+    out_flat[idx] = src[perm]
+    return out
+
+
 def _group_stats(mask, scores, pose_raw_ratio, pose_cal_ratio):
     out = {
         "n": int(mask.sum().detach().cpu()),
@@ -155,6 +186,20 @@ class M1MotionCrossfitAudit:
         L = _interaction_matrix_per_pixel(depth, K)
         quadrants = _quadrant_masks(H, W, device)
 
+        yy, xx = torch.meshgrid(
+            torch.arange(H, device=device, dtype=dtype),
+            torch.arange(W, device=device, dtype=dtype),
+            indexing="ij",
+        )
+        fx = K[0, 0].to(device=device, dtype=dtype)
+        fy = K[1, 1].to(device=device, dtype=dtype)
+        cx = K[0, 2].to(device=device, dtype=dtype)
+        cy = K[1, 2].to(device=device, dtype=dtype)
+        radius2 = ((xx - cx) / fx.clamp_min(1.0e-12)) ** 2 + (
+            (yy - cy) / fy.clamp_min(1.0e-12)
+        ) ** 2
+        trace_LL = (L * L).sum(dim=(-2, -1)).clamp_min(0)
+
         base_eval_valid = (
             torch.isfinite(depth)
             & (depth > 0)
@@ -167,7 +212,7 @@ class M1MotionCrossfitAudit:
             & initial_static_mask.bool()
         )
 
-        score_names = (
+        base_score_names = (
             "raw_resid_px",
             "d2_observation_only",
             "d2_predictive_raw",
@@ -176,6 +221,20 @@ class M1MotionCrossfitAudit:
             "d2_ablate_raw_shape_loso_scale",
             "d2_ablate_loso_scale_isotropic",
         )
+        source_d2_names = (
+            "d2_source_geometry_only_matched",
+            "d2_source_constant_scale",
+            "d2_source_shuffled_scale",
+        )
+        source_scalar_names = (
+            "source_scale_loso_trace",
+            "source_geometry_trace_LL",
+            "source_depth_m",
+            "source_radius2_norm",
+            "source_scale_over_trace_LL",
+        )
+        score_names = base_score_names + source_d2_names + source_scalar_names
+
         folds = []
         pooled = {
             "static": {name: [] for name in score_names},
@@ -223,18 +282,44 @@ class M1MotionCrossfitAudit:
             trace_raw = (pose_raw[..., 0, 0] + pose_raw[..., 1, 1]).clamp_min(0)
             trace_cal = (pose_cal[..., 0, 0] + pose_cal[..., 1, 1]).clamp_min(0)
 
-            # Scale/shape decomposition in projected 2D flow-covariance space.
-            # These controls require no extra probabilistic fits.
+            eval_mask = base_eval_valid & holdout
+            dyn = baseline_dynamic_mask.bool() & eval_mask
+            sta = (~baseline_dynamic_mask.bool()) & eval_mask
+
+            # V2 projected 2D scale/shape decomposition.
             pose_loso_shape_raw_scale = _scale_cov_to_trace(pose_cal, trace_raw)
             pose_raw_shape_loso_scale = _scale_cov_to_trace(pose_raw, trace_cal)
             pose_loso_scale_isotropic = _isotropic_cov_from_trace(trace_cal)
+
+            # V3 scale-source controls. None uses dynamic/static labels.
+            # Geometry-only: use tr(L I L^T)=||L||_F^2, then match only the
+            # held-out-fold median scale to the full LOSO projected trace.
+            trace_geometry_matched, geometry_match_factor = _median_match(
+                trace_LL, trace_cal, eval_mask
+            )
+            pose_geometry_only = _isotropic_cov_from_trace(trace_geometry_matched)
+
+            if bool(eval_mask.any()):
+                full_trace_median = torch.median(trace_cal[eval_mask]).clamp_min(0)
+            else:
+                full_trace_median = torch.zeros((), device=device, dtype=dtype)
+            trace_constant = torch.ones_like(trace_cal) * full_trace_median
+            pose_constant = _isotropic_cov_from_trace(trace_constant)
+
+            shuffle_seed = (
+                (int(frame) + 1) * 1000003 + (int(fold_idx) + 1) * 9176
+            ) % 2147483647
+            trace_shuffled = _shuffle_on_mask(trace_cal, eval_mask, shuffle_seed)
+            pose_shuffled = _isotropic_cov_from_trace(trace_shuffled)
 
             d2_obs = _maha2(residual, r00, r01, r11)
             scores = {
                 "raw_resid_px": residual_norm,
                 "d2_observation_only": d2_obs,
                 "d2_predictive_raw": _pose_maha(residual, r00, r01, r11, pose_raw),
-                "d2_predictive_loso_sensitivity": _pose_maha(residual, r00, r01, r11, pose_cal),
+                "d2_predictive_loso_sensitivity": _pose_maha(
+                    residual, r00, r01, r11, pose_cal
+                ),
                 "d2_ablate_loso_shape_raw_scale": _pose_maha(
                     residual, r00, r01, r11, pose_loso_shape_raw_scale
                 ),
@@ -244,13 +329,23 @@ class M1MotionCrossfitAudit:
                 "d2_ablate_loso_scale_isotropic": _pose_maha(
                     residual, r00, r01, r11, pose_loso_scale_isotropic
                 ),
+                "d2_source_geometry_only_matched": _pose_maha(
+                    residual, r00, r01, r11, pose_geometry_only
+                ),
+                "d2_source_constant_scale": _pose_maha(
+                    residual, r00, r01, r11, pose_constant
+                ),
+                "d2_source_shuffled_scale": _pose_maha(
+                    residual, r00, r01, r11, pose_shuffled
+                ),
+                "source_scale_loso_trace": trace_cal,
+                "source_geometry_trace_LL": trace_LL,
+                "source_depth_m": depth,
+                "source_radius2_norm": radius2,
+                "source_scale_over_trace_LL": trace_cal / trace_LL.clamp_min(1.0e-12),
             }
             ratio_raw = trace_raw / trace_obs
             ratio_cal = trace_cal / trace_obs
-
-            eval_mask = base_eval_valid & holdout
-            dyn = baseline_dynamic_mask.bool() & eval_mask
-            sta = (~baseline_dynamic_mask.bool()) & eval_mask
 
             invariant_keys = {
                 "raw_pred_gt_obs_fraction": "d2_predictive_raw",
@@ -258,6 +353,9 @@ class M1MotionCrossfitAudit:
                 "loso_shape_raw_scale_pred_gt_obs_fraction": "d2_ablate_loso_shape_raw_scale",
                 "raw_shape_loso_scale_pred_gt_obs_fraction": "d2_ablate_raw_shape_loso_scale",
                 "loso_scale_isotropic_pred_gt_obs_fraction": "d2_ablate_loso_scale_isotropic",
+                "source_geometry_pred_gt_obs_fraction": "d2_source_geometry_only_matched",
+                "source_constant_pred_gt_obs_fraction": "d2_source_constant_scale",
+                "source_shuffled_pred_gt_obs_fraction": "d2_source_shuffled_scale",
             }
             invariants = {}
             for key, score_name in invariant_keys.items():
@@ -276,44 +374,107 @@ class M1MotionCrossfitAudit:
                     else float("nan")
                 )
 
-            # Verify the intended trace matching numerically on the held-out region.
             def trace_relerr(cov, target):
                 tr = cov[..., 0, 0] + cov[..., 1, 1]
                 den = target.abs().clamp_min(1.0e-12)
-                return float(((tr - target).abs() / den)[eval_mask].max().detach().cpu()) \
-                    if bool(eval_mask.any()) else float("nan")
+                return (
+                    float(
+                        ((tr - target).abs() / den)[eval_mask]
+                        .max()
+                        .detach()
+                        .cpu()
+                    )
+                    if bool(eval_mask.any())
+                    else float("nan")
+                )
 
-            invariants.update({
-                "loso_shape_raw_scale_trace_relerr_max": trace_relerr(
-                    pose_loso_shape_raw_scale, trace_raw
-                ),
-                "raw_shape_loso_scale_trace_relerr_max": trace_relerr(
-                    pose_raw_shape_loso_scale, trace_cal
-                ),
-                "loso_scale_isotropic_trace_relerr_max": trace_relerr(
-                    pose_loso_scale_isotropic, trace_cal
-                ),
-            })
+            invariants.update(
+                {
+                    "loso_shape_raw_scale_trace_relerr_max": trace_relerr(
+                        pose_loso_shape_raw_scale, trace_raw
+                    ),
+                    "raw_shape_loso_scale_trace_relerr_max": trace_relerr(
+                        pose_raw_shape_loso_scale, trace_cal
+                    ),
+                    "loso_scale_isotropic_trace_relerr_max": trace_relerr(
+                        pose_loso_scale_isotropic, trace_cal
+                    ),
+                    "source_geometry_median_match_ratio": (
+                        float(
+                            (
+                                torch.median(trace_geometry_matched[eval_mask])
+                                / torch.median(trace_cal[eval_mask]).clamp_min(1.0e-20)
+                            )
+                            .detach()
+                            .cpu()
+                        )
+                        if bool(eval_mask.any())
+                        else float("nan")
+                    ),
+                    "source_constant_median_match_ratio": (
+                        float(
+                            (
+                                torch.median(trace_constant[eval_mask])
+                                / torch.median(trace_cal[eval_mask]).clamp_min(1.0e-20)
+                            )
+                            .detach()
+                            .cpu()
+                        )
+                        if bool(eval_mask.any())
+                        else float("nan")
+                    ),
+                    "source_shuffle_mean_relerr": (
+                        float(
+                            (
+                                (
+                                    trace_shuffled[eval_mask].mean()
+                                    - trace_cal[eval_mask].mean()
+                                ).abs()
+                                / trace_cal[eval_mask].mean().abs().clamp_min(1.0e-20)
+                            )
+                            .detach()
+                            .cpu()
+                        )
+                        if bool(eval_mask.any())
+                        else float("nan")
+                    ),
+                }
+            )
 
-            folds.append({
-                "fold": int(fold_idx),
-                "n_train_static": int(train_mask.sum().detach().cpu()),
-                "n_eval": int(eval_mask.sum().detach().cpu()),
-                "n_static": int(sta.sum().detach().cpu()),
-                "n_dynamic": int(dyn.sum().detach().cpu()),
-                "xi": xi.detach().cpu(),
-                "covariance_mode": str(result.get("covariance_mode")),
-                "cluster_count": int(result.get("cluster_counts", {}).get(self.block_size, 0)),
-                "groups": {
-                    "baseline_static": _group_stats(sta, scores, ratio_raw, ratio_cal),
-                    "baseline_dynamic": _group_stats(dyn, scores, ratio_raw, ratio_cal),
-                },
-                "invariants": invariants,
-            })
+            folds.append(
+                {
+                    "fold": int(fold_idx),
+                    "n_train_static": int(train_mask.sum().detach().cpu()),
+                    "n_eval": int(eval_mask.sum().detach().cpu()),
+                    "n_static": int(sta.sum().detach().cpu()),
+                    "n_dynamic": int(dyn.sum().detach().cpu()),
+                    "xi": xi.detach().cpu(),
+                    "covariance_mode": str(result.get("covariance_mode")),
+                    "cluster_count": int(
+                        result.get("cluster_counts", {}).get(self.block_size, 0)
+                    ),
+                    "source_control": {
+                        "geometry_match_factor": geometry_match_factor,
+                        "full_trace_median": float(full_trace_median.detach().cpu()),
+                        "shuffle_seed": int(shuffle_seed),
+                    },
+                    "groups": {
+                        "baseline_static": _group_stats(
+                            sta, scores, ratio_raw, ratio_cal
+                        ),
+                        "baseline_dynamic": _group_stats(
+                            dyn, scores, ratio_raw, ratio_cal
+                        ),
+                    },
+                    "invariants": invariants,
+                }
+            )
 
             for name, mask in (("static", sta), ("dynamic", dyn)):
                 for score_name in score_names:
-                    pooled[name][score_name].append(scores[score_name][mask].detach().cpu())
+                    pooled[name][score_name].append(
+                        scores[score_name][mask].detach().cpu()
+                    )
                 pooled[name]["ratio_raw"].append(ratio_raw[mask].detach().cpu())
                 pooled[name]["ratio_cal"].append(ratio_cal[mask].detach().cpu())
 
@@ -325,9 +486,16 @@ class M1MotionCrossfitAudit:
         for name in ("static", "dynamic"):
             pooled_groups["baseline_" + name] = {
                 "n": int(cat(name, "d2_observation_only").numel()),
-                **{score_name: _quantiles(cat(name, score_name)) for score_name in score_names},
-                "pose_raw_to_observation_trace_ratio": _quantiles(cat(name, "ratio_raw")),
-                "pose_loso_to_observation_trace_ratio": _quantiles(cat(name, "ratio_cal")),
+                **{
+                    score_name: _quantiles(cat(name, score_name))
+                    for score_name in score_names
+                },
+                "pose_raw_to_observation_trace_ratio": _quantiles(
+                    cat(name, "ratio_raw")
+                ),
+                "pose_loso_to_observation_trace_ratio": _quantiles(
+                    cat(name, "ratio_cal")
+                ),
             }
 
         auc = {
@@ -338,7 +506,7 @@ class M1MotionCrossfitAudit:
         }
 
         payload = {
-            "method": "m1_motion_spatial_crossfit_shadow_v2_scale_shape",
+            "method": "m1_motion_spatial_crossfit_shadow_v3_scale_source",
             "frame": int(frame),
             "dystart": None if dystart is None else int(dystart),
             "fold": self.fold,
@@ -348,8 +516,10 @@ class M1MotionCrossfitAudit:
                 "training_uses_baseline_static_only": True,
                 "evaluation_is_held_out_spatial_region": True,
                 "loso_calibration_is_sensitivity_only": True,
-                "ablation_space": "projected_2d_flow_covariance",
+                "ablation_space": "projected_flow_covariance_and_scale_source",
                 "ablation_requires_extra_fits": False,
+                "source_controls_use_dynamic_labels": False,
+                "shuffle_uses_global_rng": False,
             },
             "block_size": self.block_size,
             "folds": folds,
